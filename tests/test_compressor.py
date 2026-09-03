@@ -425,6 +425,36 @@ class WarningAggregationTest(CompressorTestCase):
         self.assertIn("restored", third.warnings[0])
 
 
+class OutputBudgetPromptTest(unittest.TestCase):
+    """The compressor must tell the model its own `max_tokens` budget in
+    the user message -- otherwise the model has no way to self-regulate
+    COMPACT/COMPRESS length against the cap `_compute_max_tokens` now
+    enforces, and truncation (see TruncatedResponseTest) becomes likely
+    rather than a rare edge case."""
+
+    def test_outbound_message_states_the_actual_max_tokens_budget(self) -> None:
+        body = _json.loads(
+            _build_request_body("payload", TrafficClass.GENERAL, None, "m", 777)
+        )
+        content = body["messages"][0]["content"]
+        self.assertIn("777", content)
+
+    def test_budget_stated_reflects_thinking_adjusted_max_tokens(self) -> None:
+        # thinking_budget_tokens=1024 raises max_tokens above the 512
+        # passed in (see test_max_tokens_raised_above_thinking_budget_
+        # when_needed below) -- the message must state the raised,
+        # actually-enforced value, not the pre-adjustment one.
+        body = _json.loads(
+            _build_request_body(
+                "payload", TrafficClass.GENERAL, None, "m", 512,
+                thinking_budget_tokens=1024,
+            )
+        )
+        content = body["messages"][0]["content"]
+        self.assertIn(str(body["max_tokens"]), content)
+        self.assertNotIn("512", content)
+
+
 class ThinkingBudgetRequestBodyTest(unittest.TestCase):
     """`_build_request_body` shape correctness for the new optional
     `thinking` field -- no network call, no AalpClient/Compressor

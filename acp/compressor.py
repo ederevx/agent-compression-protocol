@@ -160,11 +160,14 @@ def _compute_max_tokens(estimated_input_tokens: int, ceiling: int) -> int:
 
 
 def _build_user_message(
-    payload: str, traffic_class: TrafficClass, reduction_hint: str | None
+    payload: str, traffic_class: TrafficClass, reduction_hint: str | None, max_tokens: int
 ) -> str:
     hint = reduction_hint or "none"
     return (
-        f"Traffic class: {traffic_class.value}. Size-band hint: {hint}.\n\n"
+        f"Traffic class: {traffic_class.value}. Size-band hint: {hint}. "
+        f"Output budget: {max_tokens} tokens -- your response (including the "
+        f"ACP-MODE line) is cut off if it exceeds this, so scale COMPACT/COMPRESS "
+        f"output to fit; PASS is exempt, it never needs the budget.\n\n"
         f"---\n\n{payload}"
     )
 
@@ -188,7 +191,9 @@ def _build_request_body(
         "messages": [
             {
                 "role": "user",
-                "content": _build_user_message(payload, traffic_class, reduction_hint),
+                "content": _build_user_message(
+                    payload, traffic_class, reduction_hint, max_tokens
+                ),
             }
         ],
     }
