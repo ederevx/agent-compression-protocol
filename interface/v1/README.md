@@ -61,7 +61,7 @@ line. ACP's ingress imposes no read/write deadline of its own; a caller
 enforces its own budgets as one cumulative deadline across however many
 individual socket reads/writes a call takes.
 
-## The seven operations
+## The six operations
 
 ### `context.evaluate` — SYNCHRONOUS GATE
 
@@ -72,14 +72,13 @@ until a result is available or `synchronous_timeout` elapses.
 Request body: `payload`, `traffic_class`
 (`general`/`native_agent_report`/`downward_context`), `receiver`
 (`{host, session_id, agent_id}`), and optionally `flow_id`,
-`synchronous_timeout`, `prior_provenance`, `force_policy`
-(`passthrough`/`block`).
+`synchronous_timeout`.
 
 Response: the same `compression_result_envelope` shape on every outcome —
 `{"outcome", "mode", "output", "warnings", "message", "provenance"}` —
 because `acp.compressor.CompressionResult` always populates all five
-fields regardless of success/failure (a failed compression still carries
-a passthrough-or-placeholder `output` per ACP's own failure policy).
+fields regardless of success/failure (a failed compression always
+passes the original payload through unchanged).
 Status code follows `outcomes.values.<outcome>.response_status_code` in
 `contract.json`; every response also carries an `X-Acp-Outcome` header
 naming the outcome explicitly, mirroring AALP's own `X-Aalp-Outcome`
@@ -88,9 +87,9 @@ requirement — see `x_acp_outcome_header` below for why.
 ### `context.prepare` — BACKGROUND PREFETCH
 
 `POST /v1/context/prepare` — enqueue/deduplicate background preparation
-without blocking the caller. Same payload/traffic_class/receiver/flow_id/
-prior_provenance fields as `context.evaluate`; no `synchronous_timeout`
-or `force_policy` — both are `context.evaluate`-only.
+without blocking the caller. Same payload/traffic_class/receiver/flow_id
+fields as `context.evaluate`; no `synchronous_timeout` — that's
+`context.evaluate`-only.
 Response: `{"job_id": "..."}`, `202 Accepted`. `prepare()` never installs a
 result anywhere by itself (§12) — a caller must explicitly `context.resolve`
 at its own safe boundary.
@@ -165,12 +164,10 @@ new — that would require a new major interface version instead.
 | `invalid_response` | AALP's response didn't parse as ACP's own compressor response protocol. | 502 |
 | `upstream_error` | AALP reported an upstream transport-level failure. | 502 |
 
-On every non-`success` outcome, ACP's own failure policy
-(`acp.compressor.FailurePolicy`) still decides `mode`/`output`: a
-passthrough policy returns `mode: "PASS"` with the original payload;
-a block policy returns `mode: null` with a placeholder `output` string.
-Both are still reported with the real, non-`success` `outcome` value and
-the matching non-200 status code — a client must never infer success from
+On every non-`success` outcome, ACP always passes the original payload
+through unchanged (`mode: "PASS"`, `output` = the original payload),
+still reported with the real, non-`success` `outcome` value and the
+matching non-200 status code — a client must never infer success from
 the presence of a usable `output` field alone.
 
 `context.prepare`, `source.store`, `service.capabilities`, and

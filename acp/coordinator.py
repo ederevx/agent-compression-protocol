@@ -49,7 +49,6 @@ from pathlib import Path
 
 from acp import compressor as compressor_mod
 from acp import containment
-from acp import gate
 from acp import provenance as provenance_mod
 from acp.aalp_client import AalpClient
 from acp.compressor import CompressionResult, Compressor
@@ -194,29 +193,20 @@ class Coordinator:
         self,
         source_hash: str,
         traffic_class: TrafficClass,
-        receiver_key: ReceiverKey,
         flow_id: str | None,
-        payload: str,
         *,
         urgency_class: str,
         state: JobState,
     ) -> tuple[str, Job]:
         """Create, store, and (optionally) start a new `Job`. Caller holds `self._lock`."""
-        host, session_id, agent_id = receiver_key
         job_id = uuid.uuid4().hex
         now = time.time()
         job = Job(
             job_id=job_id,
-            source_ref=source_hash,
             source_hash=source_hash,
-            receiver_host=host,
-            receiver_session_id=session_id,
-            receiver_agent_id=agent_id,
             flow_id=flow_id,
-            turn_id=None,
             traffic_class=traffic_class,
             urgency_class=urgency_class,
-            estimated_input_tokens=gate.estimate_tokens(payload),
             created_at=now,
             started_at=now if state is JobState.RUNNING else None,
             completed_at=None,
@@ -275,12 +265,17 @@ class Coordinator:
         self,
         payload: str,
         traffic_class: TrafficClass,
+        # Required by interface v1's wire contract (mirrors `prepare()`
+        # below); validated but not otherwise consumed since the pressure-
+        # tracking subsystem this once fed was removed. Left in the public
+        # signature rather than dropped in this pass -- unlike `urgency`,
+        # every production caller already supplies a real one, so dropping
+        # it is a separate, larger-blast-radius decision than this pass's
+        # scope.
         receiver_key: ReceiverKey,
         *,
         flow_id: str | None = None,
         synchronous_timeout: float | None = None,
-        prior_provenance=None,
-        force_policy=None,
     ) -> CompressionResult:
         timeout = (
             self._default_synchronous_timeout
@@ -318,7 +313,7 @@ class Coordinator:
                 if job is not None:
                     self._store.cache.pop(key, None)
                 own_job_id, _job = self._register_job(
-                    source_hash, traffic_class, receiver_key, flow_id, payload,
+                    source_hash, traffic_class, flow_id,
                     urgency_class=_SYNCHRONOUS_URGENCY, state=JobState.RUNNING,
                 )
                 self._store.cache[key] = own_job_id
@@ -347,7 +342,7 @@ class Coordinator:
             self._telemetry.increment("synchronous_gate_cache_misses")
             with self._lock:
                 own_job_id, _job = self._register_job(
-                    source_hash, traffic_class, receiver_key, flow_id, payload,
+                    source_hash, traffic_class, flow_id,
                     urgency_class=_SYNCHRONOUS_URGENCY, state=JobState.RUNNING,
                 )
                 # Only claim the cache slot if nobody currently owns it
@@ -361,8 +356,7 @@ class Coordinator:
             self._telemetry.increment("synchronous_gate_cache_misses")
 
         result = self._compressor.compress(
-            payload, traffic_class, prior_provenance=prior_provenance,
-            flow_id=flow_id, force_policy=force_policy,
+            payload, traffic_class, flow_id=flow_id,
         )
         self._finalize_job(own_job_id, result)
         return result
@@ -373,10 +367,9 @@ class Coordinator:
         self,
         payload: str,
         traffic_class: TrafficClass,
-        receiver_key: ReceiverKey,
+        receiver_key: ReceiverKey,  # see evaluate()'s own comment above
         *,
         flow_id: str | None = None,
-        prior_provenance=None,
     ) -> str:
         source_hash = provenance_mod.compute_hash(payload)
         key = self._cache_key(source_hash, traffic_class)
@@ -395,12 +388,12 @@ class Coordinator:
                 self._store.cache.pop(key, None)
 
             job_id, _job = self._register_job(
-                source_hash, traffic_class, receiver_key, flow_id, payload,
+                source_hash, traffic_class, flow_id,
                 urgency_class=_PREFETCH_URGENCY, state=JobState.QUEUED,
             )
             self._store.cache[key] = job_id
             self._store.cache_keys[job_id] = key
-            self._store.pending[job_id] = (payload, prior_provenance, flow_id)
+            self._store.pending[job_id] = (payload, flow_id)
             self._telemetry.increment("background_jobs_enqueued")
 
         thread = threading.Thread(target=self._run_background_job, args=(job_id,), daemon=True)
@@ -417,14 +410,14 @@ class Coordinator:
                 # that nothing depended on must not emit a warning, so we
                 # simply never call the compressor for it.
                 return
-            payload, prior_provenance, flow_id = pending
+            payload, flow_id = pending
             transition(job, JobState.RUNNING)
             job.started_at = time.time()
             traffic_class = job.traffic_class
 
         self._telemetry.increment("background_jobs_started")
         result = self._compressor.compress(
-            payload, traffic_class, prior_provenance=prior_provenance, flow_id=flow_id,
+            payload, traffic_class, flow_id=flow_id,
         )
         self._finalize_job(job_id, result)
 

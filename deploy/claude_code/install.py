@@ -12,11 +12,10 @@ back unchanged and rewritten byte-for-byte equivalent (only reformatted):
   `permissions.deny`, so the MCP-provided `bash` tool (which routes
   output through ACP, failing open to raw output if ACP is unreachable)
   is the only way to run a shell command; and adds this repo's own hook
-  commands into `hooks.SubagentStart`, `hooks.SubagentStop`, and
-  `hooks.PreCompact` (each identified by a stable marker substring in
-  its `command`, so re-running this script is idempotent and existing
-  entries from other tools, e.g. agent-mem-struct, are never touched or
-  duplicated).
+  commands into `hooks.SubagentStart` and `hooks.SubagentStop` (each
+  identified by a stable marker substring in its `command`, so
+  re-running this script is idempotent and existing entries from other
+  tools, e.g. agent-mem-struct, are never touched or duplicated).
 
 `hooks.PreToolUse` (matched to the `Task` tool, for "parent -> child
 oversized support context") is deliberately NOT installed by this

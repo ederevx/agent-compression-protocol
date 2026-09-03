@@ -74,7 +74,7 @@ subprocess, all failing open (silent no-op) on any ACP error:
 `deploy/claude_code/install.py` and `deploy/codex/install.py` install
 these additively into each host's live config -- `mcpServers.acp-bash`/
 `permissions.deny` (Claude) or `codex mcp add` (Codex), plus the hook
-entries into `hooks.SubagentStart`/`SubagentStop`/`PreCompact` (and,
+entries into `hooks.SubagentStart`/`SubagentStop` (and,
 with `--with-parent-child-context`, `PreToolUse`). Every other existing
 key/entry (e.g. agent-mem-struct's hooks) is left untouched; re-running
 either script is a no-op once installed. Run with `--dry-run` to preview

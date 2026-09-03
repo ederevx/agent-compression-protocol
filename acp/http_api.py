@@ -29,7 +29,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from acp.compressor import CompressionResult, FailurePolicy
+from acp.compressor import CompressionResult
 from acp.coordinator import Coordinator
 from acp.errors import Outcome, TrafficClass
 from acp.ingress import Handler
@@ -126,38 +126,13 @@ def _parse_optional_number(value: Any, field_name: str) -> float | None:
     return float(value)
 
 
-def _parse_provenance(value: Any) -> Provenance | None:
-    if value is None:
-        return None
-    if not isinstance(value, dict):
-        raise _BadRequest("prior_provenance must be an object or null")
-    try:
-        return Provenance(
-            processed=bool(value["processed"]),
-            source_hash=str(value["source_hash"]),
-            generation=int(value["generation"]),
-        )
-    except KeyError as exc:
-        raise _BadRequest(f"prior_provenance missing required field: {exc}") from None
-
-
 def _serialize_provenance(provenance: Provenance | None) -> dict | None:
     if provenance is None:
         return None
     return {
         "processed": provenance.processed,
         "source_hash": provenance.source_hash,
-        "generation": provenance.generation,
     }
-
-
-def _parse_force_policy(value: Any) -> FailurePolicy | None:
-    if value is None:
-        return None
-    try:
-        return FailurePolicy(value)
-    except ValueError:
-        raise _BadRequest(f"invalid force_policy: {value!r}") from None
 
 
 def _serialize_result(result: CompressionResult) -> dict:
@@ -202,12 +177,9 @@ def build_handler(coordinator: Coordinator) -> Handler:
         synchronous_timeout = _parse_optional_number(
             payload.get("synchronous_timeout"), "synchronous_timeout"
         )
-        prior_provenance = _parse_provenance(payload.get("prior_provenance"))
-        force_policy = _parse_force_policy(payload.get("force_policy"))
         result = coordinator.evaluate(
             text, traffic_class, receiver_key,
             flow_id=flow_id, synchronous_timeout=synchronous_timeout,
-            prior_provenance=prior_provenance, force_policy=force_policy,
         )
         return _result_response(result)
 
@@ -219,10 +191,9 @@ def build_handler(coordinator: Coordinator) -> Handler:
         traffic_class = _parse_traffic_class(payload.get("traffic_class"))
         receiver_key = _parse_receiver(payload.get("receiver"))
         flow_id = _parse_optional_str(payload.get("flow_id"), "flow_id")
-        prior_provenance = _parse_provenance(payload.get("prior_provenance"))
         job_id = coordinator.prepare(
             text, traffic_class, receiver_key,
-            flow_id=flow_id, prior_provenance=prior_provenance,
+            flow_id=flow_id,
         )
         return _json_response(202, {"job_id": job_id})
 

@@ -8,16 +8,10 @@ from acp.jobs import Job, JobState, JobTransitionError, is_terminal, transition
 def _make_job(state: JobState = JobState.QUEUED) -> Job:
     return Job(
         job_id="job-1",
-        source_ref="ref://source-1",
         source_hash="a" * 64,
-        receiver_host="host-1",
-        receiver_session_id="session-1",
-        receiver_agent_id=None,
         flow_id=None,
-        turn_id=None,
         traffic_class=TrafficClass.GENERAL,
         urgency_class="normal",
-        estimated_input_tokens=1000,
         created_at=0.0,
         started_at=None,
         completed_at=None,
@@ -32,12 +26,9 @@ class JobFieldsTest(unittest.TestCase):
     def test_no_credential_like_field_present(self) -> None:
         field_names = {field.name for field in dataclasses.fields(Job)}
         forbidden_substrings = ("credential", "secret", "token", "password", "key")
-        # "estimated_input_tokens" legitimately contains "token" as a
-        # token-count field, not a secret; exclude it explicitly.
         suspicious = {
             name for name in field_names
             if any(bad in name.lower() for bad in forbidden_substrings)
-            and name != "estimated_input_tokens"
         }
         self.assertEqual(suspicious, set())
 
@@ -46,23 +37,16 @@ class JobFieldsTest(unittest.TestCase):
         self.assertEqual(
             field_names,
             {
-                "job_id", "source_ref", "source_hash", "receiver_host",
-                "receiver_session_id", "receiver_agent_id", "flow_id", "turn_id",
-                "traffic_class", "urgency_class", "estimated_input_tokens",
+                "job_id", "source_hash", "flow_id",
+                "traffic_class", "urgency_class",
                 "created_at", "started_at", "completed_at", "result_ref",
                 "result_hash", "state", "policy_version",
             },
         )
 
-    def test_receiver_agent_id_nullable_for_root(self) -> None:
-        job = _make_job()
-        job.receiver_agent_id = None
-        self.assertIsNone(job.receiver_agent_id)
-
-    def test_flow_and_turn_id_optional(self) -> None:
+    def test_flow_id_optional(self) -> None:
         job = _make_job()
         self.assertIsNone(job.flow_id)
-        self.assertIsNone(job.turn_id)
 
 
 class JobStateTest(unittest.TestCase):

@@ -205,7 +205,6 @@ class TelemetryTest(AcpServeEndToEndTest):
         parsed = json.loads(body)
         counters = parsed["counters"]
         self.assertEqual(counters["compression_attempts"], 0)
-        self.assertEqual(counters["native_compression_fallbacks"], 0)
 
     def test_real_compression_event_through_live_path_is_observable(self) -> None:
         # A real INSPECT-mode round-trip through the live evaluate path
@@ -235,7 +234,6 @@ class TelemetryTest(AcpServeEndToEndTest):
         self.assertEqual(counters["compression_attempts"], 1)
         self.assertEqual(counters["compression_successes"], 1)
         self.assertGreater(counters["compression_input_tokens"], 0)
-        self.assertEqual(counters["native_compression_fallbacks"], 0)
 
         dumped = json.dumps(parsed)
         self.assertNotIn(self.fake.secret, dumped)

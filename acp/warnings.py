@@ -10,13 +10,12 @@ notice). Repeated failures while already unhealthy return `[]` -- the
 caller can still inspect `consecutive_failures` for its own bookkeeping,
 it just doesn't get a duplicate user-facing warning.
 
-Deliberately holds no reference to `acp.compressor.FailurePolicy` (or
-any other compressor-internal type) so this module has no import-time
-dependency on `acp.compressor` -- callers pass a plain `blocked: bool`
-instead. Scope one instance per compression flow (e.g. one per
-`Compressor` instance); this class keeps no module-level state, so a
-later coordinator wave can construct as many independent trackers as
-it needs (per-provider, per-receiver, ...).
+Deliberately holds no reference to any compressor-internal type, so
+this module has no import-time dependency on `acp.compressor`. Scope
+one instance per compression flow (e.g. one per `Compressor` instance);
+this class keeps no module-level state, so a later coordinator wave can
+construct as many independent trackers as it needs (per-provider,
+per-receiver, ...).
 """
 from __future__ import annotations
 
@@ -44,7 +43,6 @@ class CompressionWarningTracker:
         *,
         elapsed_seconds: float,
         estimated_tokens: int,
-        blocked: bool,
     ) -> list[str]:
         """Advance to (or stay in) the unhealthy state.
 
@@ -57,13 +55,10 @@ class CompressionWarningTracker:
         if not was_healthy:
             return []
 
-        if blocked:
-            exposure = "payload blocked instead of exposed"
-        else:
-            exposure = (
-                f"~{estimated_tokens} estimated tokens are passing through "
-                "uncompressed"
-            )
+        exposure = (
+            f"~{estimated_tokens} estimated tokens are passing through "
+            "uncompressed"
+        )
         warning = (
             f"ACP compression {outcome.value} after {elapsed_seconds:.1f}s; "
             f"{exposure}. Native fallback is disabled."

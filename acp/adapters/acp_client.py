@@ -322,9 +322,9 @@ class AcpClient:
         """`POST /v1/source/store`. Raw binary body, not JSON -- mirrors
         `_handle_store` in `acp/http_api.py`, which reads the request body
         directly rather than parsing it as a JSON envelope. Returns the
-        resulting `source_hash` for later reference (e.g. as
-        `prior_provenance.source_hash` on a subsequent `evaluate`/
-        `prepare` call for the same content)."""
+        resulting `source_hash` for content-addressed provenance/audit
+        registration only -- there is no operation to read it back, and
+        no other call in this interface accepts it as input."""
         status, response_body = self._call(
             "POST", "/v1/source/store", content,
             content_type="application/octet-stream", timeout=timeout,

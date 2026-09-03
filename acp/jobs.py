@@ -17,10 +17,10 @@ from typing import Optional
 
 from acp.errors import TrafficClass
 
-# (host, session_id, agent_id-or-None) identifying who a job's compressed
-# result is for -- mirrors Job's own receiver_host/receiver_session_id/
-# receiver_agent_id fields below, which is why it lives here rather than
-# in any one particular consumer of it.
+# (host, session_id, agent_id-or-None) identifying who requested a job.
+# Accepted by Coordinator.evaluate()/prepare() as part of interface v1's
+# required `receiver` field, but not currently stored on `Job` or read
+# back by any coordinator logic.
 ReceiverKey = tuple[str, str, Optional[str]]
 
 
@@ -92,16 +92,10 @@ class JobTransitionError(ValueError):
 @dataclass
 class Job:
     job_id: str
-    source_ref: str
     source_hash: str
-    receiver_host: str
-    receiver_session_id: str
-    receiver_agent_id: str | None
     flow_id: str | None
-    turn_id: str | None
     traffic_class: TrafficClass
     urgency_class: str
-    estimated_input_tokens: int
     created_at: float
     started_at: float | None
     completed_at: float | None

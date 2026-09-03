@@ -10,9 +10,9 @@ usage; confirmed idempotent -- re-adding the same name just overwrites).
 
 `~/.codex/hooks.json` is touched additively, same discipline as the
 Claude installer: this repo's hook commands (identified by a stable
-marker substring in each `command`) are merged into `hooks.SubagentStart`,
-`hooks.SubagentStop`, and `hooks.PreCompact`, leaving every other event
-and every agent-mem-struct entry untouched.
+marker substring in each `command`) are merged into `hooks.SubagentStart`
+and `hooks.SubagentStop`, leaving every other event and every
+agent-mem-struct entry untouched.
 
 `hooks.PreToolUse` (matched to `spawn_agent`, for "parent -> child
 oversized support context") and shell-tool-exclusivity (disabling

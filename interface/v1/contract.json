@@ -68,7 +68,7 @@
         "response_status_code": "200 (context.evaluate/context.resolve); 202 (context.prepare, which reports only a job_id, never an outcome directly)"
       },
       "unavailable": {
-        "meaning": "AALP itself is unreachable or reported its target provider unavailable. No compressed output was produced; the response's 'mode'/'output' fields reflect ACP's own failure policy (passthrough of the original payload, or a placeholder if the payload's failure policy is BLOCK -- see acp.compressor.FailurePolicy).",
+        "meaning": "AALP itself is unreachable or reported its target provider unavailable. No compressed output was produced; the response's 'mode'/'output' fields always passthrough the original payload unchanged.",
         "response_status_code": 503
       },
       "queue_timeout": {
@@ -106,9 +106,7 @@
           "traffic_class": { "type": "string", "enum": ["general", "native_agent_report", "downward_context"] },
           "receiver": { "$ref": "#/definitions/receiver" },
           "flow_id": { "type": ["string", "null"], "description": "Optional audit/grouping label, forwarded to AALP's own X-Aalp-Flow-Id if a compressor call is made." },
-          "synchronous_timeout": { "type": ["number", "null"], "description": "Seconds to wait on a coalesced in-flight job before falling through to this call's own attempt. Defaults to the coordinator's own configured default when null/absent." },
-          "prior_provenance": { "anyOf": [{ "$ref": "#/definitions/provenance" }, { "type": "null" }] },
-          "force_policy": { "type": ["string", "null"], "enum": ["passthrough", "block", null], "description": "Overrides the coordinator's own token-count-based failure policy for this call only." }
+          "synchronous_timeout": { "type": ["number", "null"], "description": "Seconds to wait on a coalesced in-flight job before falling through to this call's own attempt. Defaults to the coordinator's own configured default when null/absent." }
         },
         "additionalProperties": false
       },
@@ -136,11 +134,10 @@
           "payload": { "type": "string" },
           "traffic_class": { "type": "string", "enum": ["general", "native_agent_report", "downward_context"] },
           "receiver": { "$ref": "#/definitions/receiver" },
-          "flow_id": { "type": ["string", "null"] },
-          "prior_provenance": { "anyOf": [{ "$ref": "#/definitions/provenance" }, { "type": "null" }] }
+          "flow_id": { "type": ["string", "null"] }
         },
         "additionalProperties": false,
-        "notes": "No synchronous_timeout or force_policy field -- both are context.evaluate-only. A prepared job that fails still resolves to a terminal CompressionResult (never blocks context.resolve indefinitely); force_policy only ever applies to a synchronous evaluate call's own attempt."
+        "notes": "No synchronous_timeout field -- that is context.evaluate-only. A prepared job that fails still resolves to a terminal CompressionResult (never blocks context.resolve indefinitely)."
       },
       "response": {
         "type": "object",
@@ -265,14 +262,13 @@
     },
     "provenance": {
       "type": "object",
-      "required": ["processed", "source_hash", "generation"],
+      "required": ["processed", "source_hash"],
       "properties": {
         "processed": { "type": "boolean" },
-        "source_hash": { "type": "string" },
-        "generation": { "type": "integer", "minimum": 0 }
+        "source_hash": { "type": "string" }
       },
       "additionalProperties": false,
-      "description": "Serializes acp.provenance.Provenance verbatim."
+      "description": "Serializes acp.provenance.Provenance verbatim. Output-only audit metadata on every compression_result_envelope -- no operation in this interface accepts it as input."
     },
     "compression_result_envelope": {
       "type": "object",
