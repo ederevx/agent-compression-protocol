@@ -11,6 +11,7 @@ from acp.compressor import (
     FailurePolicy,
     _build_request_body,
     _compute_max_tokens,
+    _compute_target_tokens,
 )
 from acp.errors import Outcome, TrafficClass
 from acp.provenance import compute_hash
@@ -242,7 +243,7 @@ class OutputOnlyCompressedContentPromptTest(unittest.TestCase):
 
     def test_system_prompt_forbids_commentary_and_meta_discussion(self) -> None:
         body = _json.loads(
-            _build_request_body("payload", TrafficClass.GENERAL, None, "m", 512)
+            _build_request_body("payload", TrafficClass.GENERAL, None, "m", 256, 512)
         )
         system = body["system"]
         self.assertIn("STRICTLY AND ONLY", system)
@@ -251,27 +252,64 @@ class OutputOnlyCompressedContentPromptTest(unittest.TestCase):
 
     def test_user_message_reinforces_output_only_the_compressed_content(self) -> None:
         body = _json.loads(
-            _build_request_body("payload", TrafficClass.GENERAL, None, "m", 512)
+            _build_request_body("payload", TrafficClass.GENERAL, None, "m", 256, 512)
         )
         content = body["messages"][0]["content"]
         self.assertIn("nothing but the compressed content itself", content)
 
 
+class CompressAsMuchAsPossiblePromptTest(unittest.TestCase):
+    """The model must be told its real goal is maximal safe reduction --
+    not simply staying under whatever budget/ceiling it is given. The
+    50%/ceiling figures are framed as limits, never as targets to
+    approach or fill."""
+
+    def test_system_prompt_frames_budget_as_maximum_not_goal(self) -> None:
+        body = _json.loads(
+            _build_request_body("payload", TrafficClass.GENERAL, None, "m", 256, 512)
+        )
+        system = body["system"]
+        self.assertIn("smallest output", system)
+        self.assertIn("not approaching, filling, or matching", system)
+        self.assertIn("Neither number is a goal", system)
+
+    def test_user_message_frames_ceiling_as_maximum_not_goal(self) -> None:
+        body = _json.loads(
+            _build_request_body("payload", TrafficClass.GENERAL, None, "m", 256, 512)
+        )
+        content = body["messages"][0]["content"]
+        self.assertIn("NOT a target to reach", content)
+        self.assertIn("smallest output", content)
+
+
+class TargetTokensTest(unittest.TestCase):
+    """`_compute_target_tokens` is the strict, untolerated 50% figure
+    told to the model as its aim -- no tolerance, no ceiling."""
+
+    def test_target_is_exactly_half_of_estimated_input(self) -> None:
+        self.assertEqual(_compute_target_tokens(20000), 10000)
+        self.assertEqual(_compute_target_tokens(8001), 4000)
+
+
 class MaxTokensCapTest(unittest.TestCase):
-    """`_compute_max_tokens` must never request more than half of a
-    payload's own estimated input tokens -- the architectural >=50%
-    reduction guarantee, not just an advisory ceiling."""
+    """`_compute_max_tokens` must never request much more than half of a
+    payload's own estimated input tokens -- the target is a strict 50%,
+    and the enforced hard cutoff extends that by a small, fixed 5%
+    tolerance (of estimated input) purely to absorb token-estimation
+    slack, never a relaxation of what the model is asked to do."""
 
-    def test_boundary_input_just_above_bypass_stays_within_half(self) -> None:
-        # Old logic (min(ceiling, input)) gave 4096/8001 =~ 51.19%, i.e.
-        # LESS than 50% was cut -- the exact gap this cap closes.
+    def test_boundary_input_just_above_bypass_stays_near_half(self) -> None:
+        # target = 8001 // 2 = 4000; tolerance = round(8001 * 0.05) = 400;
+        # extended = 4400, ceiling (4096) binds.
         max_tokens = _compute_max_tokens(8001, 4096)
-        self.assertLessEqual(max_tokens, 8001 // 2)
-        self.assertEqual(max_tokens, 4000)
+        self.assertLessEqual(max_tokens, round(8001 * 0.55))
+        self.assertEqual(max_tokens, 4096)
 
-    def test_half_of_input_binds_when_ceiling_is_higher(self) -> None:
+    def test_half_of_input_plus_tolerance_binds_when_ceiling_is_higher(self) -> None:
+        # target = 10000, tolerance = round(20000 * 0.05) = 1000 -> 11000
         max_tokens = _compute_max_tokens(20000, 100000)
-        self.assertEqual(max_tokens, 10000)
+        self.assertEqual(max_tokens, 11000)
+        self.assertLessEqual(max_tokens, round(20000 * 0.55))
 
     def test_ceiling_still_binds_when_lower_than_half(self) -> None:
         max_tokens = _compute_max_tokens(50000, 4096)
@@ -281,22 +319,27 @@ class MaxTokensCapTest(unittest.TestCase):
         max_tokens = _compute_max_tokens(100, 4096)
         self.assertEqual(max_tokens, 256)
 
+    def test_tolerance_never_exceeds_fifty_five_percent_of_input(self) -> None:
+        for estimated_input_tokens in (8001, 9000, 20000, 50000, 100000):
+            max_tokens = _compute_max_tokens(estimated_input_tokens, ceiling=1_000_000)
+            self.assertLessEqual(max_tokens, round(estimated_input_tokens * 0.55))
+
 
 class MaxTokensCapWiringTest(CompressorTestCase):
-    """The 50% cap must actually reach the outbound AALP request body,
-    not just the helper function -- covered end-to-end so a future
-    refactor that breaks the wiring still fails this test."""
+    """The ~50%-plus-tolerance cap must actually reach the outbound AALP
+    request body, not just the helper function -- covered end-to-end so
+    a future refactor that breaks the wiring still fails this test."""
 
     def setUp(self) -> None:
         super().setUp()
-        # A high ceiling isolates the half-of-input cap as the binding
-        # constraint (the default ceiling of 4096 would otherwise mask
-        # it for this payload size).
+        # A high ceiling isolates the fraction-of-input cap as the
+        # binding constraint (the default ceiling of 4096 would
+        # otherwise mask it for this payload size).
         self.compressor = Compressor(
             self.client, self.telemetry, max_tokens_ceiling=1_000_000
         )
 
-    def test_outbound_max_tokens_is_half_of_estimated_input(self) -> None:
+    def test_outbound_max_tokens_is_half_of_input_plus_tolerance(self) -> None:
         self._add_ci_provider()
         self.fake.program_response(
             "ci", "/v1/messages", outcome="success",
@@ -305,8 +348,22 @@ class MaxTokensCapWiringTest(CompressorTestCase):
         self.compressor.compress(_BIG_PAYLOAD, TrafficClass.GENERAL)
         sent_body = _json.loads(self.fake.last_body)
         estimated_input_tokens = len(_BIG_PAYLOAD) // 4
-        self.assertEqual(sent_body["max_tokens"], estimated_input_tokens // 2)
-        self.assertLessEqual(sent_body["max_tokens"], estimated_input_tokens // 2)
+        expected = estimated_input_tokens // 2 + round(estimated_input_tokens * 0.05)
+        self.assertEqual(sent_body["max_tokens"], expected)
+        self.assertLessEqual(sent_body["max_tokens"], round(estimated_input_tokens * 0.55))
+
+    def test_outbound_message_states_the_strict_fifty_percent_ceiling(self) -> None:
+        self._add_ci_provider()
+        self.fake.program_response(
+            "ci", "/v1/messages", outcome="success",
+            body=_compressor_body("COMPACT", "ok"),
+        )
+        self.compressor.compress(_BIG_PAYLOAD, TrafficClass.GENERAL)
+        sent_body = _json.loads(self.fake.last_body)
+        estimated_input_tokens = len(_BIG_PAYLOAD) // 4
+        content = sent_body["messages"][0]["content"]
+        self.assertIn(f"Reduction ceiling: {estimated_input_tokens // 2} tokens", content)
+        self.assertIn("NOT a target to reach", content)
 
 
 class TruncatedResponseTest(CompressorTestCase):
@@ -504,7 +561,7 @@ class OutputBudgetPromptTest(unittest.TestCase):
 
     def test_outbound_message_states_the_actual_max_tokens_budget(self) -> None:
         body = _json.loads(
-            _build_request_body("payload", TrafficClass.GENERAL, None, "m", 777)
+            _build_request_body("payload", TrafficClass.GENERAL, None, "m", 300, 777)
         )
         content = body["messages"][0]["content"]
         self.assertIn("777", content)
@@ -516,7 +573,7 @@ class OutputBudgetPromptTest(unittest.TestCase):
         # actually-enforced value, not the pre-adjustment one.
         body = _json.loads(
             _build_request_body(
-                "payload", TrafficClass.GENERAL, None, "m", 512,
+                "payload", TrafficClass.GENERAL, None, "m", 256, 512,
                 thinking_budget_tokens=1024,
             )
         )
@@ -533,14 +590,14 @@ class ThinkingBudgetRequestBodyTest(unittest.TestCase):
 
     def test_default_omits_thinking_field(self) -> None:
         body = _json.loads(
-            _build_request_body("payload", TrafficClass.GENERAL, None, "m", 512)
+            _build_request_body("payload", TrafficClass.GENERAL, None, "m", 256, 512)
         )
         self.assertNotIn("thinking", body)
 
     def test_explicit_budget_adds_thinking_field(self) -> None:
         body = _json.loads(
             _build_request_body(
-                "payload", TrafficClass.GENERAL, None, "m", 512,
+                "payload", TrafficClass.GENERAL, None, "m", 256, 512,
                 thinking_budget_tokens=1024,
             )
         )
@@ -554,7 +611,7 @@ class ThinkingBudgetRequestBodyTest(unittest.TestCase):
         # so _build_request_body must raise it, not send an invalid body.
         body = _json.loads(
             _build_request_body(
-                "payload", TrafficClass.GENERAL, None, "m", 512,
+                "payload", TrafficClass.GENERAL, None, "m", 256, 512,
                 thinking_budget_tokens=1024,
             )
         )
@@ -563,7 +620,7 @@ class ThinkingBudgetRequestBodyTest(unittest.TestCase):
     def test_max_tokens_left_alone_when_already_sufficient(self) -> None:
         body = _json.loads(
             _build_request_body(
-                "payload", TrafficClass.GENERAL, None, "m", 4096,
+                "payload", TrafficClass.GENERAL, None, "m", 2048, 4096,
                 thinking_budget_tokens=1024,
             )
         )

@@ -52,11 +52,27 @@ DEFAULT_MODEL = "deepseek-v4-flash"
 
 # Ceiling on the compressed output's `max_tokens`, tunable later. The
 # actual cap used per call is min(this ceiling, half the payload's own
-# estimated token count) -- a reduction stage should not be allowed to
-# ask for more than half its input's tokens back out, floored so tiny
-# payloads still get a workable budget. See `_compute_max_tokens`.
+# estimated token count, plus a small tolerance -- see
+# `_MAX_TOKENS_TOLERANCE_FRACTION`) -- a reduction stage should not be
+# allowed to ask for much more than half its input's tokens back out,
+# floored so tiny payloads still get a workable budget. See
+# `_compute_max_tokens` and `_compute_target_tokens`.
 DEFAULT_MAX_TOKENS_CEILING = 4096
 _MIN_MAX_TOKENS = 256
+
+# `_compute_max_tokens`'s hard, API-enforced cap extends
+# `_compute_target_tokens`'s strict 50% figure by this fraction of the
+# payload's estimated input tokens. `gate.py`'s `token_estimator` is a
+# coarse char/4 approximation of the real tokenizer, so a genuinely
+# well-compressed response can occasionally land a little over the
+# *estimated* 50% mark while still being under 50% of the *real* input
+# token count -- this tolerance exists purely to keep that estimation
+# slack from spuriously truncating good output via `stop_reason:
+# max_tokens`. It is deliberately not surfaced to the model as something
+# to use: the model is told to target the strict, untolerated figure
+# from `_compute_target_tokens` and to compress as much as it reasonably
+# can, never to fill whatever budget it is given.
+_MAX_TOKENS_TOLERANCE_FRACTION = 0.05
 
 # `None` means "no `thinking` field at all" -- the historical, unchanged
 # default. AALP's `ci` provider forwards the request body opaquely
@@ -94,6 +110,8 @@ Given a payload, choose exactly one mode:
 When relevant, preserve exactly or losslessly represent: latest user instructions; requirements and prohibitions; file paths; code identifiers and symbols; API signatures; commands; compiler/test/runtime errors; numeric values and thresholds; versions and hashes; decisions already made and their status; validation results; unresolved ambiguity/conflict; pending work and known failure state.
 
 You must NOT: redesign the system; solve architecture or debugging work that belongs downstream; silently resolve ambiguity; change task intent; invent missing facts; pick a side between conflicting evidence without preserving the conflict; declare unfinished work complete.
+
+For COMPACT/COMPRESS, your goal is the smallest output that safely preserves the required substance -- not approaching, filling, or matching any budget or ceiling you are given. The message below states a reduction ceiling (the maximum ever permitted, 50% of the payload) and, separately, a hard output budget (a safety margin, never something to spend). Neither number is a goal: compress as far below the ceiling as the required-substance rules allow, and treat "as small as possible while staying correct" as the only real objective. Never pad, restate, or elaborate to use up more of either figure, and never stop compressing early just because you are already under one.
 
 Respond with exactly one line as your first line: "ACP-MODE: PASS", "ACP-MODE: COMPACT", or "ACP-MODE: COMPRESS".
 If PASS, output nothing else after that line.
@@ -140,48 +158,95 @@ class CompressionResult(AcpResult):
     provenance: Provenance | None = None
 
 
-def _compute_max_tokens(estimated_input_tokens: int, ceiling: int) -> int:
-    """Cap the compressor's requested `max_tokens` so any actual
-    compression (the INSPECT path -- BYPASS never reaches this) cannot
-    ask for more than half of its own estimated input: an architectural
-    >=50% reduction guarantee, not just an advisory ceiling.
+def _compute_target_tokens(estimated_input_tokens: int) -> int:
+    """The strict, untolerated 50%-of-input reduction CEILING communicated
+    to the compressor model -- half of `estimated_input_tokens`, no
+    tolerance and no `max_tokens` ceiling applied.
+
+    Despite the name (kept for continuity with `_compute_max_tokens`'s
+    internal `target` variable), this is presented to the model as a
+    maximum never to be reached, not a value to aim for -- the model is
+    separately instructed (`COMPRESSOR_SYSTEM_PROMPT`, `_build_user_
+    message`) that its real goal is the smallest output that safely
+    preserves required substance, as far below this figure as the
+    content allows. Telling the model "compress to N tokens" invites it
+    to fill N; telling it "N is the most you may ever use" does not.
 
     `estimated_input_tokens` must be the effective input -- the payload
     being compressed alone, i.e. `decision.estimated_tokens` from
     `gate.evaluate(payload, ...)` -- never a count that includes
     `COMPRESSOR_SYSTEM_PROMPT` or `_build_user_message`'s traffic-class/
     budget wrapper text. Folding the compressor's own instructions into
-    the ratio would inflate the allowed output for every call by a fixed
-    amount unrelated to what's actually being compressed, weakening the
-    50% guarantee precisely when the payload is small enough for that
-    fixed overhead to matter.
+    the ratio would inflate the effective ceiling for every call by a
+    fixed amount unrelated to what's actually being compressed.
 
-    `estimated_input_tokens // 2` alone would undershoot the floor only
-    for a payload smaller than `2 * _MIN_MAX_TOKENS` estimated tokens;
-    every built-in traffic class's `bypass_max` (gate.py) is well above
-    that, so `_MIN_MAX_TOKENS` never actually binds against the 50%
-    guarantee for a default-threshold payload. A caller-supplied custom
+    `_compute_max_tokens` computes the separate, tolerance-extended
+    figure actually enforced as the hard `max_tokens` cutoff sent to the
+    API -- the two are intentionally different numbers.
+    """
+    return estimated_input_tokens // 2
+
+
+def _compute_max_tokens(estimated_input_tokens: int, ceiling: int) -> int:
+    """Cap the compressor's requested `max_tokens` so any actual
+    compression (the INSPECT path -- BYPASS never reaches this) cannot
+    ask for much more than half of its own estimated input.
+
+    The hard cutoff extends `_compute_target_tokens`'s strict 50% figure
+    by `_MAX_TOKENS_TOLERANCE_FRACTION` (5%) of the estimated input. This
+    absorbs `gate.py`'s `token_estimator` char/4 approximation's own
+    slack against the real tokenizer, so a response that is genuinely
+    within the true 50% guarantee doesn't get spuriously truncated over
+    an imprecise estimate. It is not a relaxation of the guarantee the
+    model is asked to meet: the model is told the strict, untolerated
+    target from `_compute_target_tokens`, never this extended figure,
+    and is instructed to compress as much as it reasonably can rather
+    than use whatever budget it is given (see `COMPRESSOR_SYSTEM_PROMPT`
+    and `_build_user_message`). The structural floor this function
+    enforces moves from "never more than 50% of estimated input" to
+    "never more than 55%" as a deliberate, documented trade -- not a
+    silent or hidden change, and the model's own instructions and stated
+    target are unaffected by it.
+
+    `estimated_input_tokens // 2` (plus tolerance) alone would undershoot
+    the floor only for a payload smaller than roughly `2 * _MIN_MAX_TOKENS`
+    estimated tokens; every built-in traffic class's `bypass_max`
+    (gate.py) is well above that, so `_MIN_MAX_TOKENS` never actually
+    binds for a default-threshold payload. A caller-supplied custom
     threshold letting a much smaller payload reach INSPECT is the one
-    case where the floor could push `max_tokens` back above half its
-    input -- an accepted trade favoring a workable output budget over
+    case where the floor could push `max_tokens` back above the intended
+    ratio -- an accepted trade favoring a workable output budget over
     the ratio for payloads that small.
     """
-    return max(_MIN_MAX_TOKENS, min(ceiling, estimated_input_tokens // 2))
+    target = _compute_target_tokens(estimated_input_tokens)
+    tolerance = round(estimated_input_tokens * _MAX_TOKENS_TOLERANCE_FRACTION)
+    return max(_MIN_MAX_TOKENS, min(ceiling, target + tolerance))
 
 
 def _build_user_message(
-    payload: str, traffic_class: TrafficClass, reduction_hint: str | None, max_tokens: int
+    payload: str,
+    traffic_class: TrafficClass,
+    reduction_hint: str | None,
+    target_tokens: int,
+    max_tokens: int,
 ) -> str:
     hint = reduction_hint or "none"
     return (
         f"Traffic class: {traffic_class.value}. Size-band hint: {hint}. "
-        f"Output budget: {max_tokens} tokens -- sized from the payload below "
+        f"Reduction ceiling: {target_tokens} tokens -- the maximum ever "
+        f"permitted (50% of the payload's own size), NOT a target to "
+        f"reach. Your real goal is the smallest output that safely "
+        f"preserves the required substance, as far below this ceiling as "
+        f"the content allows -- do not pad, restate, or stop compressing "
+        f"early just because you are already under it. Hard output "
+        f"budget: {max_tokens} tokens -- sized from the payload below "
         f"only (everything above this line, including this budget note "
-        f"itself, is excluded from that count). Your response (including "
-        f"the ACP-MODE line) is cut off if it exceeds this, so scale "
-        f"COMPACT/COMPRESS output to fit, and output nothing but the "
-        f"compressed content itself -- no commentary, no restatement of "
-        f"these instructions. PASS is exempt, it never needs the budget.\n\n"
+        f"itself, is excluded from that count); this is a small safety "
+        f"margin for estimation error, not something to use on purpose "
+        f"-- your response (including the ACP-MODE line) is cut off if "
+        f"it exceeds this. Output nothing but the compressed content "
+        f"itself -- no commentary, no restatement of these instructions. "
+        f"PASS is exempt, it never needs either figure.\n\n"
         f"---\n\n{payload}"
     )
 
@@ -191,6 +256,7 @@ def _build_request_body(
     traffic_class: TrafficClass,
     reduction_hint: str | None,
     model: str,
+    target_tokens: int,
     max_tokens: int,
     thinking_budget_tokens: int | None = None,
 ) -> bytes:
@@ -206,7 +272,7 @@ def _build_request_body(
             {
                 "role": "user",
                 "content": _build_user_message(
-                    payload, traffic_class, reduction_hint, max_tokens
+                    payload, traffic_class, reduction_hint, target_tokens, max_tokens
                 ),
             }
         ],
@@ -265,10 +331,12 @@ def _parse_compressor_response(body: bytes) -> tuple[str, str, dict[str, Any] | 
     if not isinstance(usage, dict):
         usage = None
 
-    # The tightened `max_tokens` cap in `_compute_max_tokens` (>=50%
-    # reduction guarantee) makes truncation a real, newly-introduced
-    # risk for COMPACT/COMPRESS: a real Anthropic-shaped response cut
-    # off mid-output reports `stop_reason: "max_tokens"`. PASS is exempt
+    # The tightened `max_tokens` cap in `_compute_max_tokens` (~50%
+    # reduction guarantee, plus a small tolerance for estimation slack --
+    # see `_MAX_TOKENS_TOLERANCE_FRACTION`) makes truncation a real,
+    # newly-introduced risk for COMPACT/COMPRESS: a real Anthropic-shaped
+    # response cut off mid-output reports `stop_reason: "max_tokens"`.
+    # PASS is exempt
     # -- its trailing text is always discarded and the original payload
     # substituted verbatim, so a truncated PASS response cannot corrupt
     # anything downstream. Treating a truncated COMPACT/COMPRESS body as
@@ -391,10 +459,11 @@ class Compressor:
 
         # INSPECT: hand off to the external compressor.
         self._telemetry.increment("compression_attempts")
+        target_tokens = _compute_target_tokens(decision.estimated_tokens)
         max_tokens = _compute_max_tokens(decision.estimated_tokens, self._max_tokens_ceiling)
         body = _build_request_body(
-            payload, traffic_class, decision.reduction_hint, self._model, max_tokens,
-            self._thinking_budget_tokens,
+            payload, traffic_class, decision.reduction_hint, self._model,
+            target_tokens, max_tokens, self._thinking_budget_tokens,
         )
 
         started = time.monotonic()
