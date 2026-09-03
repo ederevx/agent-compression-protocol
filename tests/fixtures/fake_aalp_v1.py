@@ -148,6 +148,7 @@ class FakeAalpV1:
         self._providers: dict[str, FakeProvider] = {}
         self._programmed: dict[tuple[str, str], deque[_ProgrammedResponse]] = {}
         self.last_headers: Any = None  # last request.forward call's headers, for assertions
+        self.last_body: bytes = b""  # last request.forward call's raw body, for assertions
 
         self.socket_path = self.root / ".aalp" / "state" / "ingress.sock"
         self._server_socket: socket.socket | None = None
@@ -328,7 +329,7 @@ class FakeAalpV1:
                     path = envelope["path"]
                     headers = envelope["headers"]
                     raw_body = envelope.get("body") or ""
-                    _ = base64.b64decode(raw_body) if raw_body else b""
+                    body = base64.b64decode(raw_body) if raw_body else b""
                 except Exception:
                     _write_frame(
                         connection,
@@ -341,6 +342,7 @@ class FakeAalpV1:
                             {"error": "unauthorized"}).encode()))
                     return
 
+                self.last_body = body
                 try:
                     status, response_headers, response_body = self._dispatch(
                         method, path, headers)

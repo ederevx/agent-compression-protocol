@@ -3,8 +3,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import json as _json
+
 from acp.aalp_client import AalpClient
-from acp.compressor import Compressor, FailurePolicy
+from acp.compressor import Compressor, FailurePolicy, _build_request_body
 from acp.errors import Outcome, TrafficClass
 from acp.provenance import compute_hash
 from acp.telemetry import Telemetry
@@ -142,6 +144,31 @@ class SuccessParsingTest(CompressorTestCase):
         self.assertEqual(result.mode, "COMPRESS")
         self.assertEqual(result.output, "evidence capsule")
         self.assertEqual(self.telemetry.get("compression_saved_tokens"), 11800)
+
+    def test_thinking_response_skips_leading_empty_and_thinking_blocks(self) -> None:
+        # Exact shape observed live against the real `ci` backend with
+        # `thinking` enabled during the Phase 6 benchmark: content[0] is
+        # an EMPTY text placeholder, content[1] is the thinking block,
+        # and the real answer is content[2]. See
+        # benchmarks/phase6_effort_thinking_2026-09-03.md.
+        self._add_ci_provider()
+        obj = {
+            "content": [
+                {"type": "text", "text": ""},
+                {"type": "thinking", "thinking": "reasoning...", "signature": ""},
+                {"type": "text", "text": "ACP-MODE: COMPACT\n\ncompacted via thinking"},
+            ],
+            "usage": {"input_tokens": 9000, "output_tokens": 50},
+        }
+        self.fake.program_response(
+            "ci", "/v1/messages", outcome="success",
+            body=_json.dumps(obj).encode("utf-8"),
+        )
+        result = self.compressor.compress(_BIG_PAYLOAD, TrafficClass.GENERAL)
+
+        self.assertIs(result.outcome, Outcome.SUCCESS)
+        self.assertEqual(result.mode, "COMPACT")
+        self.assertEqual(result.output, "compacted via thinking")
 
     def test_usage_absent_falls_back_to_token_estimate(self) -> None:
         self._add_ci_provider()
@@ -282,6 +309,76 @@ class WarningAggregationTest(CompressorTestCase):
         self.assertEqual(len(second.warnings), 0)
         self.assertEqual(len(third.warnings), 1)
         self.assertIn("restored", third.warnings[0])
+
+
+class ThinkingBudgetRequestBodyTest(unittest.TestCase):
+    """`_build_request_body` shape correctness for the new optional
+    `thinking` field -- no network call, no AalpClient/Compressor
+    involved, matching Phase 6's "benchmark effort/thinking modes" item.
+    """
+
+    def test_default_omits_thinking_field(self) -> None:
+        body = _json.loads(
+            _build_request_body("payload", TrafficClass.GENERAL, None, "m", 512)
+        )
+        self.assertNotIn("thinking", body)
+
+    def test_explicit_budget_adds_thinking_field(self) -> None:
+        body = _json.loads(
+            _build_request_body(
+                "payload", TrafficClass.GENERAL, None, "m", 512,
+                thinking_budget_tokens=1024,
+            )
+        )
+        self.assertEqual(
+            body["thinking"], {"type": "enabled", "budget_tokens": 1024}
+        )
+
+    def test_max_tokens_raised_above_thinking_budget_when_needed(self) -> None:
+        # max_tokens (512) is below thinking_budget_tokens (1024) --
+        # Anthropic's Messages API requires max_tokens > budget_tokens,
+        # so _build_request_body must raise it, not send an invalid body.
+        body = _json.loads(
+            _build_request_body(
+                "payload", TrafficClass.GENERAL, None, "m", 512,
+                thinking_budget_tokens=1024,
+            )
+        )
+        self.assertGreater(body["max_tokens"], 1024)
+
+    def test_max_tokens_left_alone_when_already_sufficient(self) -> None:
+        body = _json.loads(
+            _build_request_body(
+                "payload", TrafficClass.GENERAL, None, "m", 4096,
+                thinking_budget_tokens=1024,
+            )
+        )
+        self.assertEqual(body["max_tokens"], 4096)
+
+
+class CompressorThinkingBudgetWiringTest(CompressorTestCase):
+    """`Compressor(thinking_budget_tokens=...)` must actually reach the
+    outbound body -- covered end-to-end via the fake AALP fixture rather
+    than mocking `_build_request_body`, so a future refactor that breaks
+    the wiring (not just the helper) still fails this test."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.compressor = Compressor(
+            self.client, self.telemetry, thinking_budget_tokens=1024
+        )
+
+    def test_thinking_field_reaches_outbound_request(self) -> None:
+        self._add_ci_provider()
+        self.fake.program_response(
+            "ci", "/v1/messages", outcome="success",
+            body=_compressor_body("COMPACT", "ok"),
+        )
+        self.compressor.compress(_BIG_PAYLOAD, TrafficClass.GENERAL)
+        sent_body = _json.loads(self.fake.last_body)
+        self.assertEqual(
+            sent_body["thinking"], {"type": "enabled", "budget_tokens": 1024}
+        )
 
 
 if __name__ == "__main__":

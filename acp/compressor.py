@@ -58,6 +58,22 @@ DEFAULT_MODEL = "deepseek-v4-flash"
 DEFAULT_MAX_TOKENS_CEILING = 4096
 _MIN_MAX_TOKENS = 256
 
+# `None` means "no `thinking` field at all" -- the historical, unchanged
+# default. AALP's `ci` provider forwards the request body opaquely
+# (`providers/ci.json`'s `request_shape.passthrough: true`; see
+# `aalp/forwarder.py`), so an Anthropic-shaped `thinking` field reaches
+# CheapestInference's endpoint untouched if a caller opts in. Whether the
+# `deepseek-v4-flash` backend behind that endpoint actually honors it was
+# an open question until the Phase 6 benchmark in
+# `benchmarks/phase6_effort_thinking_2026-09-03.md`; see that file for
+# the measured result this default reflects.
+DEFAULT_THINKING_BUDGET_TOKENS: int | None = None
+
+# Anthropic's Messages API requires max_tokens > thinking.budget_tokens.
+# This is the minimum headroom reserved for actual output above the
+# thinking budget when thinking is enabled.
+_MIN_OUTPUT_HEADROOM_ABOVE_THINKING = 256
+
 # Mirrors `AalpClient.forward`'s own defaults; these are ACP-side
 # round-trip budgets layered on top of AALP's internal ones (see
 # `acp/aalp_client.py`'s `forward()` docstring).
@@ -144,7 +160,12 @@ def _build_request_body(
     reduction_hint: str | None,
     model: str,
     max_tokens: int,
+    thinking_budget_tokens: int | None = None,
 ) -> bytes:
+    if thinking_budget_tokens is not None:
+        max_tokens = max(
+            max_tokens, thinking_budget_tokens + _MIN_OUTPUT_HEADROOM_ABOVE_THINKING
+        )
     request = {
         "model": model,
         "max_tokens": max_tokens,
@@ -156,6 +177,11 @@ def _build_request_body(
             }
         ],
     }
+    if thinking_budget_tokens is not None:
+        request["thinking"] = {
+            "type": "enabled",
+            "budget_tokens": thinking_budget_tokens,
+        }
     return json.dumps(request).encode("utf-8")
 
 
@@ -169,7 +195,23 @@ def _parse_compressor_response(body: bytes) -> tuple[str, str, dict[str, Any] | 
     """
     try:
         response_json = json.loads(body)
-        text = response_json["content"][0]["text"]
+        content_blocks = response_json["content"]
+        # With `thinking` enabled, a real Anthropic-shaped response's
+        # `content` array holds one or more non-text blocks (a
+        # `thinking` block, and observed in practice also a leading
+        # empty `text` placeholder block) around the actual answer --
+        # confirmed live against the `ci` backend during the Phase 6
+        # benchmark (see benchmarks/phase6_effort_thinking_2026-09-03.md).
+        # `content[0]` is not reliably the answer even when it happens
+        # to have `type == "text"`, so pick the LAST non-empty text
+        # block instead: that is where the model's actual final answer
+        # lives, both with and without thinking enabled.
+        text = None
+        for block in content_blocks:
+            if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
+                text = block["text"]
+        if text is None:
+            raise KeyError("no non-empty text content block")
     except (json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
         raise CompressorProtocolViolation(
             f"compressor response is not a parseable Messages-shaped body: {exc}"
@@ -224,6 +266,7 @@ class Compressor:
         provider_id: str = DEFAULT_PROVIDER_ID,
         model: str = DEFAULT_MODEL,
         max_tokens_ceiling: int = DEFAULT_MAX_TOKENS_CEILING,
+        thinking_budget_tokens: int | None = DEFAULT_THINKING_BUDGET_TOKENS,
         queue_timeout: float = DEFAULT_QUEUE_TIMEOUT_SECONDS,
         compression_timeout: float = DEFAULT_COMPRESSION_TIMEOUT_SECONDS,
         total_timeout: float = DEFAULT_TOTAL_TIMEOUT_SECONDS,
@@ -240,6 +283,7 @@ class Compressor:
         self._provider_id = provider_id
         self._model = model
         self._max_tokens_ceiling = max_tokens_ceiling
+        self._thinking_budget_tokens = thinking_budget_tokens
         self._queue_timeout = queue_timeout
         self._compression_timeout = compression_timeout
         self._total_timeout = total_timeout
@@ -299,7 +343,8 @@ class Compressor:
         self._telemetry.increment("compression_attempts")
         max_tokens = _compute_max_tokens(decision.estimated_tokens, self._max_tokens_ceiling)
         body = _build_request_body(
-            payload, traffic_class, decision.reduction_hint, self._model, max_tokens
+            payload, traffic_class, decision.reduction_hint, self._model, max_tokens,
+            self._thinking_budget_tokens,
         )
 
         started = time.monotonic()
