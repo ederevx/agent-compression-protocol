@@ -6,9 +6,7 @@ from pathlib import Path
 import json as _json
 
 from acp.aalp_client import AalpClient
-from acp import gate
 from acp.compressor import (
-    DEFAULT_MAX_TOKENS_CEILING,
     Compressor,
     FailurePolicy,
     _build_request_body,
@@ -210,9 +208,7 @@ class MaxTokensCapExcludesWrapperTest(CompressorTestCase):
 
     def setUp(self) -> None:
         super().setUp()
-        self.compressor = Compressor(
-            self.client, self.telemetry, max_tokens_ceiling=1_000_000
-        )
+        self.compressor = Compressor(self.client, self.telemetry)
 
     def test_max_tokens_unaffected_by_traffic_class_wrapper_length(self) -> None:
         self._add_ci_provider()
@@ -284,29 +280,6 @@ class CompressAsMuchAsPossiblePromptTest(unittest.TestCase):
         self.assertIn("smallest output", content)
 
 
-class DefaultCeilingDerivationTest(unittest.TestCase):
-    """`DEFAULT_MAX_TOKENS_CEILING` must track `gate.py`'s own lowest
-    `bypass_max` (the smallest payload any traffic class ever sends to
-    INSPECT) rather than an independent hardcoded number that could
-    silently drift out of sync with it."""
-
-    def test_ceiling_equals_lowest_bypass_max_across_traffic_classes(self) -> None:
-        lowest_bypass_max = min(
-            thresholds.bypass_max for thresholds in gate.DEFAULT_THRESHOLDS.values()
-        )
-        self.assertEqual(DEFAULT_MAX_TOKENS_CEILING, lowest_bypass_max)
-
-    def test_fraction_cap_binds_at_the_lowest_threshold_class(self) -> None:
-        # Just past NATIVE_AGENT_REPORT's own bypass_max (the lowest
-        # threshold): the 50%-plus-tolerance figure must be the binding
-        # constraint, not this ceiling.
-        estimated_input_tokens = gate.NATIVE_AGENT_REPORT_THRESHOLDS.bypass_max + 1
-        max_tokens = _compute_max_tokens(estimated_input_tokens, DEFAULT_MAX_TOKENS_CEILING)
-        fraction_cap = estimated_input_tokens // 2 + round(estimated_input_tokens * 0.05)
-        self.assertEqual(max_tokens, fraction_cap)
-        self.assertLess(max_tokens, DEFAULT_MAX_TOKENS_CEILING)
-
-
 class TargetTokensTest(unittest.TestCase):
     """`_compute_target_tokens` is the strict, untolerated 50% figure
     told to the model as its aim -- no tolerance, no ceiling."""
@@ -321,32 +294,36 @@ class MaxTokensCapTest(unittest.TestCase):
     payload's own estimated input tokens -- the target is a strict 50%,
     and the enforced hard cutoff extends that by a small, fixed 5%
     tolerance (of estimated input) purely to absorb token-estimation
-    slack, never a relaxation of what the model is asked to do."""
+    slack, never a relaxation of what the model is asked to do. There is
+    no absolute upper bound: the ratio holds unconditionally, however
+    large the payload, so a bigger input never gets forced into more
+    lossy compression than a smaller one."""
 
     def test_boundary_input_just_above_bypass_stays_near_half(self) -> None:
-        # target = 8001 // 2 = 4000; tolerance = round(8001 * 0.05) = 400;
-        # extended = 4400, ceiling (4096) binds.
-        max_tokens = _compute_max_tokens(8001, 4096)
+        # target = 8001 // 2 = 4000; tolerance = round(8001 * 0.05) = 400
+        max_tokens = _compute_max_tokens(8001)
+        self.assertEqual(max_tokens, 4400)
         self.assertLessEqual(max_tokens, round(8001 * 0.55))
-        self.assertEqual(max_tokens, 4096)
 
-    def test_half_of_input_plus_tolerance_binds_when_ceiling_is_higher(self) -> None:
+    def test_half_of_input_plus_tolerance_scales_with_large_input(self) -> None:
         # target = 10000, tolerance = round(20000 * 0.05) = 1000 -> 11000
-        max_tokens = _compute_max_tokens(20000, 100000)
+        max_tokens = _compute_max_tokens(20000)
         self.assertEqual(max_tokens, 11000)
         self.assertLessEqual(max_tokens, round(20000 * 0.55))
 
-    def test_ceiling_still_binds_when_lower_than_half(self) -> None:
-        max_tokens = _compute_max_tokens(50000, 4096)
-        self.assertEqual(max_tokens, 4096)
+    def test_no_absolute_ceiling_even_for_very_large_input(self) -> None:
+        # target = 25000, tolerance = round(50000 * 0.05) = 2500 -> 27500;
+        # nothing clamps this down regardless of how large it is.
+        max_tokens = _compute_max_tokens(50000)
+        self.assertEqual(max_tokens, 27500)
 
     def test_floor_still_applies_for_tiny_input(self) -> None:
-        max_tokens = _compute_max_tokens(100, 4096)
+        max_tokens = _compute_max_tokens(100)
         self.assertEqual(max_tokens, 256)
 
     def test_tolerance_never_exceeds_fifty_five_percent_of_input(self) -> None:
         for estimated_input_tokens in (8001, 9000, 20000, 50000, 100000):
-            max_tokens = _compute_max_tokens(estimated_input_tokens, ceiling=1_000_000)
+            max_tokens = _compute_max_tokens(estimated_input_tokens)
             self.assertLessEqual(max_tokens, round(estimated_input_tokens * 0.55))
 
 
@@ -357,12 +334,7 @@ class MaxTokensCapWiringTest(CompressorTestCase):
 
     def setUp(self) -> None:
         super().setUp()
-        # A high ceiling isolates the fraction-of-input cap as the
-        # binding constraint (the default ceiling of 4096 would
-        # otherwise mask it for this payload size).
-        self.compressor = Compressor(
-            self.client, self.telemetry, max_tokens_ceiling=1_000_000
-        )
+        self.compressor = Compressor(self.client, self.telemetry)
 
     def test_outbound_max_tokens_is_half_of_input_plus_tolerance(self) -> None:
         self._add_ci_provider()

@@ -50,32 +50,19 @@ from acp.warnings import CompressionWarningTracker
 # instance.
 DEFAULT_MODEL = "deepseek-v4-flash"
 
-# Ceiling on the compressed output's `max_tokens`, tunable later. The
-# actual cap used per call is min(this ceiling, half the payload's own
-# estimated token count, plus a small tolerance -- see
-# `_MAX_TOKENS_TOLERANCE_FRACTION`) -- a reduction stage should not be
-# allowed to ask for much more than half its input's tokens back out,
-# floored so tiny payloads still get a workable budget. See
-# `_compute_max_tokens` and `_compute_target_tokens`.
-#
-# Derived from `gate.py`'s own thresholds -- the lowest `bypass_max`
-# across all traffic classes -- rather than an independent hardcoded
-# number, so this ceiling can never silently drift out of sync with the
-# smallest payload size that ever actually reaches INSPECT. Concretely
-# this is `NATIVE_AGENT_REPORT_THRESHOLDS.bypass_max` (4,000): for that
-# traffic class, the 50%-of-input figure (target + tolerance) is already
-# the binding constraint at and above its own threshold (e.g. ~2,200 for
-# a payload just past 4,000 estimated tokens, well under this ceiling),
-# so the 50% cap governs rather than an arbitrary constant for the
-# smallest inputs any traffic class ever compresses. For GENERAL/
-# DOWNWARD_CONTEXT payloads whose own thresholds sit above this ceiling,
-# this absolute number remains the binding constraint instead of the
-# 50% figure -- letting the ceiling scale with those classes' own
-# (higher) thresholds too would require raising it, not lowering it;
-# this value is deliberately the smallest-common-denominator choice.
-DEFAULT_MAX_TOKENS_CEILING = min(
-    thresholds.bypass_max for thresholds in gate.DEFAULT_THRESHOLDS.values()
-)
+# No absolute ceiling on the compressed output's `max_tokens` -- purely a
+# fraction of the payload's own estimated input tokens (half, plus a
+# small tolerance; see `_MAX_TOKENS_TOLERANCE_FRACTION`), floored so tiny
+# payloads still get a workable budget. An earlier version of this
+# module clamped the fraction against a fixed absolute ceiling (whether
+# a hardcoded 4096 or one derived from `gate.py`'s thresholds); that was
+# removed at explicit user direction, because clamping large payloads
+# down to a small absolute number forces disproportionately more lossy
+# compression exactly where the input is largest -- the opposite of what
+# the 50% ratio guarantee is supposed to mean. The ratio is now
+# unconditional: a bigger payload gets a proportionally bigger output
+# budget, all the way up. See `_compute_max_tokens` and
+# `_compute_target_tokens`.
 _MIN_MAX_TOKENS = 256
 
 # `_compute_max_tokens`'s hard, API-enforced cap extends
@@ -205,10 +192,13 @@ def _compute_target_tokens(estimated_input_tokens: int) -> int:
     return estimated_input_tokens // 2
 
 
-def _compute_max_tokens(estimated_input_tokens: int, ceiling: int) -> int:
+def _compute_max_tokens(estimated_input_tokens: int) -> int:
     """Cap the compressor's requested `max_tokens` so any actual
     compression (the INSPECT path -- BYPASS never reaches this) cannot
-    ask for much more than half of its own estimated input.
+    ask for much more than half of its own estimated input, with no
+    absolute upper bound: the ratio holds no matter how large the
+    payload is, so compression never becomes more lossy just because
+    the input is bigger.
 
     The hard cutoff extends `_compute_target_tokens`'s strict 50% figure
     by `_MAX_TOKENS_TOLERANCE_FRACTION` (5%) of the estimated input. This
@@ -238,7 +228,7 @@ def _compute_max_tokens(estimated_input_tokens: int, ceiling: int) -> int:
     """
     target = _compute_target_tokens(estimated_input_tokens)
     tolerance = round(estimated_input_tokens * _MAX_TOKENS_TOLERANCE_FRACTION)
-    return max(_MIN_MAX_TOKENS, min(ceiling, target + tolerance))
+    return max(_MIN_MAX_TOKENS, target + tolerance)
 
 
 def _build_user_message(
@@ -401,7 +391,6 @@ class Compressor:
         *,
         provider_id: str = DEFAULT_PROVIDER_ID,
         model: str = DEFAULT_MODEL,
-        max_tokens_ceiling: int = DEFAULT_MAX_TOKENS_CEILING,
         thinking_budget_tokens: int | None = DEFAULT_THINKING_BUDGET_TOKENS,
         queue_timeout: float = DEFAULT_QUEUE_TIMEOUT_SECONDS,
         compression_timeout: float = DEFAULT_COMPRESSION_TIMEOUT_SECONDS,
@@ -418,7 +407,6 @@ class Compressor:
         self._telemetry = telemetry
         self._provider_id = provider_id
         self._model = model
-        self._max_tokens_ceiling = max_tokens_ceiling
         self._thinking_budget_tokens = thinking_budget_tokens
         self._queue_timeout = queue_timeout
         self._compression_timeout = compression_timeout
@@ -478,7 +466,7 @@ class Compressor:
         # INSPECT: hand off to the external compressor.
         self._telemetry.increment("compression_attempts")
         target_tokens = _compute_target_tokens(decision.estimated_tokens)
-        max_tokens = _compute_max_tokens(decision.estimated_tokens, self._max_tokens_ceiling)
+        max_tokens = _compute_max_tokens(decision.estimated_tokens)
         body = _build_request_body(
             payload, traffic_class, decision.reduction_hint, self._model,
             target_tokens, max_tokens, self._thinking_budget_tokens,
