@@ -1,8 +1,18 @@
-"""Background compression job data model.
+"""ACP's synchronous compression job data model.
 
 Data model only: `JobState`, `Job`, and state-transition validation.
 No queueing, scheduling, or execution logic lives here — that belongs
-to the coordinator built in a later wave.
+to the coordinator.
+
+Every job here is created by `Coordinator.evaluate()` (the SYNCHRONOUS
+GATE ingress-compression path); the background-prefetch job type this
+model once also carried (`prepare()`/`resolve()`) was removed as a
+dead end -- proactive/prewarm compression of a subagent's transcript
+tail was never installable back into a receiver's context short of a
+proxy intercepting outbound API traffic, which was evaluated and
+declined (agent_protocols_v1_metadata_v1.md, "bounded-context
+reclamation," declined 2026-09-03; see STATUS.md). ACP's actual token
+reduction happens at ingress, synchronously, via `evaluate()`.
 
 HARD INVARIANT: `Job` never carries a credential, token, or other
 secret field. A job references its source and result by hash/ref only;
@@ -18,9 +28,9 @@ from typing import Optional
 from acp.errors import TrafficClass
 
 # (host, session_id, agent_id-or-None) identifying who requested a job.
-# Accepted by Coordinator.evaluate()/prepare() as part of interface v1's
-# required `receiver` field, but not currently stored on `Job` or read
-# back by any coordinator logic.
+# Accepted by Coordinator.evaluate() as part of interface v1's required
+# `receiver` field, but not currently stored on `Job` or read back by
+# any coordinator logic.
 ReceiverKey = tuple[str, str, Optional[str]]
 
 
@@ -34,14 +44,10 @@ class JobState(Enum):
     TOTAL_TIMEOUT = "total_timeout"
     BYPASSED = "bypassed"
     BLOCKED = "blocked"
-    STALE = "stale"
 
 
 # "Terminal" here means the compressor's own work on the job is done
-# (nothing left for the coordinator's synchronous/background pipeline to
-# do). READY is included even though VALID_TRANSITIONS still allows
-# READY -> STALE: that edge is expiry/garbage-collection housekeeping on
-# an already-finished job, not further compression work.
+# (nothing left for the coordinator to do).
 _TERMINAL_STATES = frozenset({
     JobState.READY,
     JobState.FAILED,
@@ -50,23 +56,14 @@ _TERMINAL_STATES = frozenset({
     JobState.TOTAL_TIMEOUT,
     JobState.BYPASSED,
     JobState.BLOCKED,
-    JobState.STALE,
 })
 
 VALID_TRANSITIONS: dict[JobState, frozenset[JobState]] = {
-    # QUEUED -> STALE (Wave D1 addition): a background job's consumer may
-    # stop needing it before AALP submission (agent_protocols_v1
-    # background-compression adjustment, §31, "before AALP submission").
-    # There is deliberately no RUNNING -> STALE edge: once a job has been
-    # submitted to AALP, §31 requires preserving AALP confirmed-close/
-    # quarantine safety rather than abandoning an in-flight request, so a
-    # RUNNING job is left to reach its own terminal state.
     JobState.QUEUED: frozenset({
         JobState.RUNNING,
         JobState.QUEUE_TIMEOUT,
         JobState.BYPASSED,
         JobState.BLOCKED,
-        JobState.STALE,
     }),
     JobState.RUNNING: frozenset({
         JobState.READY,
@@ -74,14 +71,13 @@ VALID_TRANSITIONS: dict[JobState, frozenset[JobState]] = {
         JobState.COMPRESSION_TIMEOUT,
         JobState.TOTAL_TIMEOUT,
     }),
-    JobState.READY: frozenset({JobState.STALE}),
+    JobState.READY: frozenset(),
     JobState.FAILED: frozenset(),
     JobState.QUEUE_TIMEOUT: frozenset(),
     JobState.COMPRESSION_TIMEOUT: frozenset(),
     JobState.TOTAL_TIMEOUT: frozenset(),
     JobState.BYPASSED: frozenset(),
     JobState.BLOCKED: frozenset(),
-    JobState.STALE: frozenset(),
 }
 
 
@@ -95,7 +91,6 @@ class Job:
     source_hash: str
     flow_id: str | None
     traffic_class: TrafficClass
-    urgency_class: str
     created_at: float
     started_at: float | None
     completed_at: float | None

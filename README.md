@@ -60,10 +60,7 @@ host-neutral CLI script (`--agent claude|codex`) invoked as a hook
 subprocess, all failing open (silent no-op) on any ACP error:
 
 - `subagent_report.py`: on `SubagentStart`, injects context telling the
-  subagent about the `report` tool; on `SubagentStop`, fires a
-  best-effort background `context.prepare` cache-warm over the
-  subagent's transcript tail (never a guaranteed compression point --
-  see the module docstring).
+  subagent about the `report` tool.
 - `parent_child_context.py`: on `PreToolUse` matched to the
   subagent-spawning tool (`Task` on Claude, `spawn_agent` on Codex),
   compresses only an explicit `<acp-context>...</acp-context>` block in

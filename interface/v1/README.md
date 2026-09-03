@@ -9,11 +9,10 @@ the same contract.
 
 ## Why this exists
 
-`acp.coordinator.Coordinator` is the single owner of ACP's
-background/synchronous compression state (agent_protocols_v1_background_
-compression_adjustment_metadata_v1.md §17): job dedup, the prepared-result
-cache, synchronous/background lifecycle, AALP client calls, provenance,
-and telemetry. A host
+`acp.coordinator.Coordinator` is the single owner of ACP's synchronous
+compression state (agent_protocols_v1_background_
+compression_adjustment_metadata_v1.md §17): job dedup, the result
+cache, AALP client calls, provenance, and telemetry. A host
 adapter that imported `acp.coordinator` directly, instantiated
 `Coordinator` itself, or read `.acp/` private state on disk would be
 coupled to implementation details that were never meant to be a contract
@@ -61,7 +60,15 @@ line. ACP's ingress imposes no read/write deadline of its own; a caller
 enforces its own budgets as one cumulative deadline across however many
 individual socket reads/writes a call takes.
 
-## The six operations
+## The four operations
+
+`interface_version: 2` (this revision): `context.prepare`/
+`context.resolve` (background prefetch) were removed as a dead end --
+nothing could install a prepared result back into a receiver's live
+context short of a proxy intercepting outbound API traffic, which was
+evaluated and explicitly declined (see STATUS.md, "bounded-context
+reclamation," declined 2026-09-03). `context.evaluate` below, ACP's
+actual synchronous token-reduction path, is unaffected.
 
 ### `context.evaluate` — SYNCHRONOUS GATE
 
@@ -84,25 +91,6 @@ Status code follows `outcomes.values.<outcome>.response_status_code` in
 naming the outcome explicitly, mirroring AALP's own `X-Aalp-Outcome`
 requirement — see `x_acp_outcome_header` below for why.
 
-### `context.prepare` — BACKGROUND PREFETCH
-
-`POST /v1/context/prepare` — enqueue/deduplicate background preparation
-without blocking the caller. Same payload/traffic_class/receiver/flow_id
-fields as `context.evaluate`; no `synchronous_timeout` — that's
-`context.evaluate`-only.
-Response: `{"job_id": "..."}`, `202 Accepted`. `prepare()` never installs a
-result anywhere by itself (§12) — a caller must explicitly `context.resolve`
-at its own safe boundary.
-
-### `context.resolve`
-
-`GET /v1/context/resolve/{job_id}` — resolve a job previously created by
-`context.prepare`. Still in flight (or an unknown `job_id`, e.g. already
-reclaimed by the coordinator's stale-job sweep) returns
-`{"status": "pending"}`, `200` — **this is not an error case**. A terminal
-job returns the same `compression_result_envelope`/`X-Acp-Outcome` shape
-`context.evaluate` uses, status-coded the same way.
-
 ### `source.store`
 
 `POST /v1/source/store` — register raw authoritative content,
@@ -115,12 +103,11 @@ provenance/audit registration, not as a retrieval store.
 
 ### `service.capabilities`
 
-`GET /v1/service/capabilities` → `{"service": "acp", "interface_version": 1, "capabilities": [...]}`
+`GET /v1/service/capabilities` → `{"service": "acp", "interface_version": 2, "capabilities": [...]}`
 
-The discovery entry point. v1 declares exactly the six capability strings
-above, one per operation (`context.evaluate`, `context.prepare`,
-`context.resolve`, `source.store`, `service.status`,
-`service.telemetry`).
+The discovery entry point. v2 declares exactly the four capability strings
+above, one per operation (`context.evaluate`, `source.store`,
+`service.status`, `service.telemetry`).
 
 ### `service.status`
 
@@ -147,12 +134,12 @@ internal_state`'s exclusion below.
 
 ## Outcomes
 
-`context.evaluate` and `context.resolve` report exactly one of the seven
-values already implemented in `acp/errors.py`'s `Outcome` enum — ACP's own
-outcome set; ACP never imports AALP's `Outcome`. No client-facing code
-should ever need to handle an eighth value for these two operations, and a
-future v1.x addition may never repurpose one of these to mean something
-new — that would require a new major interface version instead.
+`context.evaluate` reports exactly one of the seven values already
+implemented in `acp/errors.py`'s `Outcome` enum — ACP's own outcome set;
+ACP never imports AALP's `Outcome`. No client-facing code should ever
+need to handle an eighth value for this operation, and a future v2.x
+addition may never repurpose one of these to mean something new — that
+would require a new major interface version instead.
 
 | Outcome | Meaning | Response status |
 |---|---|---|
@@ -170,29 +157,27 @@ still reported with the real, non-`success` `outcome` value and the
 matching non-200 status code — a client must never infer success from
 the presence of a usable `output` field alone.
 
-`context.prepare`, `source.store`, `service.capabilities`, and
-`service.status` are not modeled with this enum; they use ordinary
-status-code semantics (see `contract.json` for each one's exact status
-codes).
+`source.store`, `service.capabilities`, and `service.status` are not
+modeled with this enum; they use ordinary status-code semantics (see
+`contract.json` for each one's exact status codes).
 
 ## `X-Acp-Outcome`
 
-Required on every `context.evaluate` and `context.resolve` (terminal)
-response, mirroring AALP's own `X-Aalp-Outcome` requirement exactly: two
-different outcomes can share the same status code (504 covers three
-distinct outcomes, 502 covers two), so status code alone cannot always
-disambiguate which outcome actually happened. A client should treat this
-header's absence as a contract violation rather than guessing from the
-status code or the response body's own `outcome` field alone (though in
-practice this header and the body's `outcome` field are always kept
-identical).
+Required on every `context.evaluate` response, mirroring AALP's own
+`X-Aalp-Outcome` requirement exactly: two different outcomes can share
+the same status code (504 covers three distinct outcomes, 502 covers
+two), so status code alone cannot always disambiguate which outcome
+actually happened. A client should treat this header's absence as a
+contract violation rather than guessing from the status code or the
+response body's own `outcome` field alone (though in practice this
+header and the body's `outcome` field are always kept identical).
 
 ## What this interface explicitly does not cover
 
 Coordinator internals (job dict entries, cache keys, lock state) and raw
 stored source content are never exposed in any form, in any version — see
 `excluded_from_this_interface` in `contract.json`. A conforming client
-only ever calls the six operations documented above and in
+only ever calls the four operations documented above and in
 `contract.json`. It never imports an `acp.*` Python module, never
 instantiates `Coordinator` directly, never calls a function not named on
 this page, and never reads `.acp/` state from disk beyond the two

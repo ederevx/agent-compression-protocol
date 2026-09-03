@@ -11,7 +11,6 @@ def _make_job(state: JobState = JobState.QUEUED) -> Job:
         source_hash="a" * 64,
         flow_id=None,
         traffic_class=TrafficClass.GENERAL,
-        urgency_class="normal",
         created_at=0.0,
         started_at=None,
         completed_at=None,
@@ -38,7 +37,7 @@ class JobFieldsTest(unittest.TestCase):
             field_names,
             {
                 "job_id", "source_hash", "flow_id",
-                "traffic_class", "urgency_class",
+                "traffic_class",
                 "created_at", "started_at", "completed_at", "result_ref",
                 "result_hash", "state", "policy_version",
             },
@@ -50,14 +49,13 @@ class JobFieldsTest(unittest.TestCase):
 
 
 class JobStateTest(unittest.TestCase):
-    def test_exactly_ten_states(self) -> None:
+    def test_exactly_nine_states(self) -> None:
         names = {member.name for member in JobState}
         self.assertEqual(
             names,
             {
                 "QUEUED", "RUNNING", "READY", "FAILED", "QUEUE_TIMEOUT",
                 "COMPRESSION_TIMEOUT", "TOTAL_TIMEOUT", "BYPASSED", "BLOCKED",
-                "STALE",
             },
         )
 
@@ -83,11 +81,6 @@ class TransitionTest(unittest.TestCase):
         transition(job, JobState.QUEUE_TIMEOUT)
         self.assertEqual(job.state, JobState.QUEUE_TIMEOUT)
 
-    def test_ready_to_stale_allowed(self) -> None:
-        job = _make_job(JobState.READY)
-        transition(job, JobState.STALE)
-        self.assertEqual(job.state, JobState.STALE)
-
     def test_queued_to_ready_rejected(self) -> None:
         job = _make_job(JobState.QUEUED)
         with self.assertRaises(JobTransitionError):
@@ -101,11 +94,6 @@ class TransitionTest(unittest.TestCase):
             job = _make_job(state)
             with self.assertRaises(JobTransitionError):
                 transition(job, JobState.RUNNING)
-
-    def test_stale_is_terminal(self) -> None:
-        job = _make_job(JobState.STALE)
-        with self.assertRaises(JobTransitionError):
-            transition(job, JobState.READY)
 
     def test_job_unchanged_on_rejected_transition(self) -> None:
         job = _make_job(JobState.QUEUED)

@@ -14,7 +14,6 @@ import json
 import socket
 import struct
 import tempfile
-import time
 import unittest
 from pathlib import Path
 
@@ -138,16 +137,6 @@ class AcpServeEndToEndTest(unittest.TestCase):
         response, body = self._post(path, json.dumps(obj).encode("utf-8"), **kwargs)
         return response, json.loads(body)
 
-    def _wait_until_resolved(self, job_id: str, timeout: float = 5.0) -> dict:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            response, body = self._get(f"/v1/context/resolve/{job_id}")
-            parsed = json.loads(body)
-            if parsed.get("status") != "pending":
-                return parsed
-            time.sleep(0.02)
-        self.fail(f"job {job_id} never reached a resolvable terminal state")
-
 
 class CapabilitiesAndStatusTest(AcpServeEndToEndTest):
     def test_capabilities_reachable(self) -> None:
@@ -155,7 +144,7 @@ class CapabilitiesAndStatusTest(AcpServeEndToEndTest):
         self.assertEqual(response.status, 200)
         parsed = json.loads(body)
         self.assertEqual(parsed["service"], "acp")
-        self.assertEqual(parsed["interface_version"], 1)
+        self.assertEqual(parsed["interface_version"], 2)
         self.assertIn("context.evaluate", parsed["capabilities"])
         self.assertIn("service.status", parsed["capabilities"])
 
@@ -296,32 +285,6 @@ class EvaluateTest(AcpServeEndToEndTest):
         self.assertEqual(body["outcome"], "total_timeout")
 
 
-class PrepareResolveTest(AcpServeEndToEndTest):
-    def test_prepare_then_resolve_pending_then_ready(self) -> None:
-        self.fake.program_response(
-            "ci", "/v1/messages", outcome="success",
-            body=_compressor_body("COMPACT", "prepared-output"), delay=0.2,
-        )
-        response, body = self._post_json(
-            "/v1/context/prepare",
-            {
-                "payload": _BIG_PAYLOAD,
-                "traffic_class": "general",
-                "receiver": {"host": "h", "session_id": "s", "agent_id": None},
-            },
-        )
-        self.assertEqual(response.status, 202)
-        job_id = body["job_id"]
-
-        pending_response, pending_body = self._get(f"/v1/context/resolve/{job_id}")
-        self.assertEqual(pending_response.status, 200)
-        self.assertEqual(json.loads(pending_body), {"status": "pending"})
-
-        final = self._wait_until_resolved(job_id)
-        self.assertEqual(final["outcome"], "success")
-        self.assertEqual(final["output"], "prepared-output")
-
-
 class SourceStoreTest(AcpServeEndToEndTest):
     def test_raw_body_round_trips_to_matching_source_hash(self) -> None:
         content = b"raw source bytes for http round-trip"
@@ -354,19 +317,6 @@ class AuthenticationTest(AcpServeEndToEndTest):
             authorized=False,
         )
         self.assertEqual(evaluate_response.status, 401)
-
-        prepare_response, _ = self._post(
-            "/v1/context/prepare",
-            json.dumps({
-                "payload": _SMALL_PAYLOAD, "traffic_class": "general",
-                "receiver": {"host": "h", "session_id": "s", "agent_id": None},
-            }).encode("utf-8"),
-            authorized=False,
-        )
-        self.assertEqual(prepare_response.status, 401)
-
-        resolve_response, _ = self._get("/v1/context/resolve/nonexistent", authorized=False)
-        self.assertEqual(resolve_response.status, 401)
 
         store_response, _ = self._post(
             "/v1/source/store", b"data", authorized=False,

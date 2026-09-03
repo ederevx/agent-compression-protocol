@@ -48,15 +48,6 @@ class CoordinatorTestCase(unittest.TestCase):
         defaults.update(overrides)
         self.fake.add_provider(FakeProvider(**defaults))
 
-    def _wait_until_resolved(self, job_id: str, timeout: float = 5.0):
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            result = self.coordinator.resolve(job_id)
-            if result is not None:
-                return result
-            time.sleep(0.01)
-        self.fail(f"job {job_id} never reached a resolvable terminal state")
-
 
 class ConcurrentCoalesceTest(CoordinatorTestCase):
     def test_two_concurrent_evaluate_calls_coalesce_into_one_aalp_call(self) -> None:
@@ -102,53 +93,23 @@ class ConcurrentCoalesceTest(CoordinatorTestCase):
         self.assertLess(elapsed, 2.0)
 
 
-class PrepareResolveTest(CoordinatorTestCase):
-    def test_prepare_then_resolve_returns_ready_result_once_ready(self) -> None:
-        self._add_ci_provider()
-        self.fake.program_response(
-            "ci", "/v1/messages", outcome="success",
-            body=_compressor_body("COMPACT", "prepared"), delay=0.2,
-        )
-
-        job_id = self.coordinator.prepare(_BIG_PAYLOAD, TrafficClass.GENERAL, _RECEIVER)
-        # Almost certainly still in flight immediately after prepare().
-        self.assertIsNone(self.coordinator.resolve(job_id))
-
-        result = self._wait_until_resolved(job_id)
-        self.assertIs(result.outcome, Outcome.SUCCESS)
-        self.assertEqual(result.output, "prepared")
-
-    def test_prepare_reuses_ready_cached_result(self) -> None:
-        self._add_ci_provider()
-        self.fake.program_response(
-            "ci", "/v1/messages", outcome="success",
-            body=_compressor_body("COMPACT", "cached"),
-        )
-
-        first_job_id = self.coordinator.prepare(_BIG_PAYLOAD, TrafficClass.GENERAL, _RECEIVER)
-        self._wait_until_resolved(first_job_id)
-
-        second_job_id = self.coordinator.prepare(_BIG_PAYLOAD, TrafficClass.GENERAL, _RECEIVER)
-        self.assertEqual(first_job_id, second_job_id)
-        self.assertEqual(self.telemetry.get("background_jobs_reused"), 1)
-
-
 class EvaluateCacheHitTest(CoordinatorTestCase):
-    def test_evaluate_consumes_ready_cache_from_prior_prepare(self) -> None:
+    def test_evaluate_reuses_ready_cached_result_from_prior_evaluate(self) -> None:
         self._add_ci_provider()
         self.fake.program_response(
             "ci", "/v1/messages", outcome="success",
-            body=_compressor_body("COMPACT", "from-prepare"),
+            body=_compressor_body("COMPACT", "from-first-evaluate"),
         )
 
-        job_id = self.coordinator.prepare(_BIG_PAYLOAD, TrafficClass.GENERAL, _RECEIVER)
-        self._wait_until_resolved(job_id)
+        first = self.coordinator.evaluate(_BIG_PAYLOAD, TrafficClass.GENERAL, _RECEIVER)
+        self.assertIs(first.outcome, Outcome.SUCCESS)
+        self.assertEqual(first.output, "from-first-evaluate")
 
         # Only one response was programmed; a second real AALP call here
         # would raise LookupError inside the fixture.
-        result = self.coordinator.evaluate(_BIG_PAYLOAD, TrafficClass.GENERAL, _RECEIVER)
-        self.assertIs(result.outcome, Outcome.SUCCESS)
-        self.assertEqual(result.output, "from-prepare")
+        second = self.coordinator.evaluate(_BIG_PAYLOAD, TrafficClass.GENERAL, _RECEIVER)
+        self.assertIs(second.outcome, Outcome.SUCCESS)
+        self.assertEqual(second.output, "from-first-evaluate")
         self.assertEqual(self.telemetry.get("synchronous_gate_cache_hits"), 1)
 
 
@@ -158,23 +119,33 @@ class SweepStaleJobsTest(CoordinatorTestCase):
         self.fake.program_response(
             "ci", "/v1/messages", outcome="success", body=_compressor_body("COMPACT", "old")
         )
-        old_job_id = self.coordinator.prepare(_BIG_PAYLOAD, TrafficClass.GENERAL, _RECEIVER)
-        self._wait_until_resolved(old_job_id)
+        old_result = self.coordinator.evaluate(_BIG_PAYLOAD, TrafficClass.GENERAL, _RECEIVER)
+        self.assertIs(old_result.outcome, Outcome.SUCCESS)
+        old_job_id = self.coordinator._store.cache[
+            self.coordinator._cache_key(
+                compute_hash(_BIG_PAYLOAD), TrafficClass.GENERAL
+            )
+        ]
         self.coordinator._store.jobs[old_job_id].completed_at = time.time() - 1_000
 
         self.fake.program_response(
-            "ci", "/v1/messages", outcome="success",
-            body=_compressor_body("COMPACT", "recent"), delay=1.0,
+            "ci", "/v1/messages", outcome="success", body=_compressor_body("COMPACT", "recent")
         )
-        recent_job_id = self.coordinator.prepare(
+        recent_result = self.coordinator.evaluate(
             _BIG_PAYLOAD_B, TrafficClass.GENERAL, _RECEIVER
         )
+        self.assertIs(recent_result.outcome, Outcome.SUCCESS)
+        recent_job_id = self.coordinator._store.cache[
+            self.coordinator._cache_key(
+                compute_hash(_BIG_PAYLOAD_B), TrafficClass.GENERAL
+            )
+        ]
 
         removed = self.coordinator.sweep_stale_jobs(max_age_seconds=10)
 
         self.assertIn(old_job_id, removed)
         self.assertNotIn(recent_job_id, removed)
-        self.assertIsNone(self.coordinator.resolve(old_job_id))
+        self.assertNotIn(old_job_id, self.coordinator._store.jobs)
 
 
 class StoreSourceTest(CoordinatorTestCase):

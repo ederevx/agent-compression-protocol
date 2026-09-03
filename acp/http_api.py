@@ -7,22 +7,25 @@ AALP -- where `Gateway.as_ingress_handler()` lives on the composition-root
 class itself, because `Gateway.handle()` already needed an HTTP-shaped
 `(method, path, headers, body)` signature for its own passthrough
 forwarding job -- `Coordinator`'s public API
-(`evaluate`/`prepare`/`resolve`/`store_source`/`status`) is a plain
+(`evaluate`/`store_source`/`status`) is a plain
 Python API with no HTTP shape of its own, and is
 worth keeping directly callable by an in-process host adapter with zero
-HTTP machinery involved. Putting the six-operation dispatch in this
+HTTP machinery involved. Putting the operation dispatch in this
 separate module keeps that split clean: `Coordinator` never imports
 `json` or knows an HTTP status code exists.
 
-Six operations, all under `/v1/...`, mirroring `interface/v1/contract.json`:
+Five operations, all under `/v1/...`, mirroring `interface/v1/contract.json`:
 
     POST /v1/context/evaluate
-    POST /v1/context/prepare
-    GET  /v1/context/resolve/{job_id}
     POST /v1/source/store           (raw binary body, not JSON)
     GET  /v1/service/capabilities
     GET  /v1/service/status
     GET  /v1/service/telemetry
+
+`context.prepare`/`context.resolve` (background prefetch) were removed
+in interface_version 2 -- see acp/coordinator.py's module docstring for
+why. `context.evaluate` (synchronous ingress compression, ACP's actual
+token-reduction mechanism) is unaffected.
 """
 from __future__ import annotations
 
@@ -40,12 +43,16 @@ from acp.provenance import Provenance
 # service.capabilities (below) is the only reader of this constant.
 INTERFACE_V1_CAPABILITIES: tuple[str, ...] = (
     "context.evaluate",
-    "context.prepare",
-    "context.resolve",
     "source.store",
     "service.status",
     "service.telemetry",
 )
+
+# Bumped from 1: context.prepare/context.resolve were removed, a
+# breaking change per interface/v1/contract.json's own compatibility
+# rules ("an operation or field is removed or renamed" requires a new
+# major interface version). See acp/coordinator.py's module docstring.
+INTERFACE_VERSION = 2
 
 # Mirrors agent-api-lane-protocol's aalp/gateway.py::_STATUS_BY_OUTCOME
 # convention exactly, applied to acp.errors.Outcome (ACP's own outcome
@@ -183,26 +190,6 @@ def build_handler(coordinator: Coordinator) -> Handler:
         )
         return _result_response(result)
 
-    def _handle_prepare(body: bytes) -> tuple[int, dict[str, str], bytes]:
-        payload = _parse_json_body(body)
-        text = payload.get("payload")
-        if not isinstance(text, str):
-            raise _BadRequest("payload must be a string")
-        traffic_class = _parse_traffic_class(payload.get("traffic_class"))
-        receiver_key = _parse_receiver(payload.get("receiver"))
-        flow_id = _parse_optional_str(payload.get("flow_id"), "flow_id")
-        job_id = coordinator.prepare(
-            text, traffic_class, receiver_key,
-            flow_id=flow_id,
-        )
-        return _json_response(202, {"job_id": job_id})
-
-    def _handle_resolve(job_id: str) -> tuple[int, dict[str, str], bytes]:
-        result = coordinator.resolve(job_id)
-        if result is None:
-            return _json_response(200, {"status": "pending"})
-        return _result_response(result)
-
     def _handle_store(body: bytes) -> tuple[int, dict[str, str], bytes]:
         source_hash = coordinator.store_source(body)
         return _json_response(201, {"source_hash": source_hash})
@@ -210,7 +197,7 @@ def build_handler(coordinator: Coordinator) -> Handler:
     def _handle_capabilities() -> tuple[int, dict[str, str], bytes]:
         return _json_response(200, {
             "service": "acp",
-            "interface_version": 1,
+            "interface_version": INTERFACE_VERSION,
             "capabilities": list(INTERFACE_V1_CAPABILITIES),
         })
 
@@ -230,13 +217,6 @@ def build_handler(coordinator: Coordinator) -> Handler:
         try:
             if method == "POST" and segments == ["v1", "context", "evaluate"]:
                 return _handle_evaluate(body)
-            if method == "POST" and segments == ["v1", "context", "prepare"]:
-                return _handle_prepare(body)
-            if (
-                method == "GET" and len(segments) == 4
-                and segments[:3] == ["v1", "context", "resolve"]
-            ):
-                return _handle_resolve(segments[3])
             if method == "POST" and segments == ["v1", "source", "store"]:
                 return _handle_store(body)
             if method == "GET" and segments == ["v1", "service", "capabilities"]:

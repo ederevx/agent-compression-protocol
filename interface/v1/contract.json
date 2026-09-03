@@ -2,14 +2,12 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://agent-compression-protocol/interface/v1/contract.json",
   "service": "acp",
-  "interface_version": 1,
+  "interface_version": 2,
   "title": "ACP interface v1",
-  "description": "ACP's own published, versioned, cross-protocol interface: the single owner of background/synchronous compression state (acp.coordinator.Coordinator), exposed over an authenticated loopback Unix domain socket for a host adapter (e.g. a future Phase-4 Claude/Codex adapter) or a local test harness to depend on, without importing an acp.* Python module, instantiating Coordinator directly, or reading '.acp/' private on-disk state beyond the two bootstrap files this document carves out. Per agent_protocols_v1_background_compression_adjustment_metadata_v1.md §17, no host adapter is permitted to run its own compression operation or manipulate '.acp/' private files directly -- every operation below is the only sanctioned path to ACP's coordinator.",
+  "description": "ACP's own published, versioned, cross-protocol interface: the single owner of synchronous compression state (acp.coordinator.Coordinator), exposed over an authenticated loopback Unix domain socket for a host adapter (e.g. a future Phase-4 Claude/Codex adapter) or a local test harness to depend on, without importing an acp.* Python module, instantiating Coordinator directly, or reading '.acp/' private on-disk state beyond the two bootstrap files this document carves out. Per agent_protocols_v1_background_compression_adjustment_metadata_v1.md §17, no host adapter is permitted to run its own compression operation or manipulate '.acp/' private files directly -- every operation below is the only sanctioned path to ACP's coordinator. interface_version 2 (this revision) removed context.prepare/context.resolve (background prefetch) as a dead end -- nothing could install a prepared result back into a receiver's live context short of a proxy intercepting outbound API traffic, which was evaluated and explicitly declined (see STATUS.md, \"bounded-context reclamation,\" declined 2026-09-03). context.evaluate, ACP's actual synchronous token-reduction path, is unaffected.",
 
   "capabilities": [
     "context.evaluate",
-    "context.prepare",
-    "context.resolve",
     "source.store",
     "service.status",
     "service.telemetry"
@@ -44,7 +42,7 @@
 
   "transport_binding": {
     "normative_for": [
-      "context.evaluate", "context.prepare", "context.resolve",
+      "context.evaluate",
       "source.store", "service.capabilities", "service.status",
       "service.telemetry"
     ],
@@ -53,7 +51,7 @@
       "socket": "AF_UNIX, SOCK_STREAM, bound at the path published in the bootstrap descriptor",
       "framing": "Each connection carries exactly one request and one response, then closes. A request or response is one frame: a 4-byte big-endian unsigned length prefix, followed by that many bytes of UTF-8-encoded JSON.",
       "request_envelope": { "method": "string, e.g. 'GET' or 'POST'", "path": "string, e.g. '/v1/context/evaluate'", "headers": "object of string to string, includes 'Authorization'", "body": "string, base64-encoded request body bytes (empty string if there is no body)" },
-      "response_envelope": { "status": "integer, an HTTP-style status code", "headers": "object of string to string, includes 'X-Acp-Outcome' for context.evaluate/context.resolve responses", "body": "string, base64-encoded response body bytes (empty string if there is no body)" },
+      "response_envelope": { "status": "integer, an HTTP-style status code", "headers": "object of string to string, includes 'X-Acp-Outcome' for context.evaluate responses", "body": "string, base64-encoded response body bytes (empty string if there is no body)" },
       "deadline_handling": "ACP's ingress imposes no read/write deadline of its own; a caller enforces its own budgets, tracked as a single cumulative deadline across however many individual socket reads/writes one call takes -- never a single per-syscall timeout, which cannot bound a multi-syscall read."
     },
     "reserved_path_prefix": "v1",
@@ -61,11 +59,11 @@
   },
 
   "outcomes": {
-    "description": "The closed set of outcomes context.evaluate and context.resolve may report, reusing acp.errors.Outcome verbatim (ACP's own outcome set -- ACP never imports AALP's). No cross-protocol client should ever need to handle a value outside this set for these two operations, and no future v1.x addition may repurpose one of these values to mean something else.",
+    "description": "The closed set of outcomes context.evaluate may report, reusing acp.errors.Outcome verbatim (ACP's own outcome set -- ACP never imports AALP's). No cross-protocol client should ever need to handle a value outside this set for this operation, and no future v2.x addition may repurpose one of these values to mean something else.",
     "values": {
       "success": {
         "meaning": "The payload was gated and, if inspected, a compressor round-trip through AALP completed and parsed successfully (mode PASS, COMPACT, or COMPRESS -- see the 'mode' response field). A gate BYPASS (payload small enough to skip the compressor entirely) is also reported as 'success' with mode 'PASS'.",
-        "response_status_code": "200 (context.evaluate/context.resolve); 202 (context.prepare, which reports only a job_id, never an outcome directly)"
+        "response_status_code": 200
       },
       "unavailable": {
         "meaning": "AALP itself is unreachable or reported its target provider unavailable. No compressed output was produced; the response's 'mode'/'output' fields always passthrough the original payload unchanged.",
@@ -116,59 +114,7 @@
       },
       "x_acp_outcome_header": {
         "requirement_level": "REQUIRED in interface v1",
-        "rationale": "Mirrors agent-api-lane-protocol/interface/v1/contract.json's request.forward.response.x_aalp_outcome_header requirement exactly: status code alone cannot always unambiguously identify which outcome produced a given response (multiple outcomes share status code 504 or 502), so X-Acp-Outcome must be present on every context.evaluate and context.resolve response, success or not."
-      },
-      "possible_outcomes": [
-        "success", "unavailable", "queue_timeout", "compression_timeout",
-        "total_timeout", "invalid_response", "upstream_error"
-      ]
-    },
-
-    "context.prepare": {
-      "summary": "BACKGROUND PREFETCH (§11): enqueue/deduplicate background preparation of a payload without blocking the caller. Never installs a result anywhere by itself -- a caller must explicitly context.resolve at its own safe boundary (§12).",
-      "binding": { "method": "POST", "path": "/v1/context/prepare" },
-      "request": {
-        "type": "object",
-        "required": ["payload", "traffic_class", "receiver"],
-        "properties": {
-          "payload": { "type": "string" },
-          "traffic_class": { "type": "string", "enum": ["general", "native_agent_report", "downward_context"] },
-          "receiver": { "$ref": "#/definitions/receiver" },
-          "flow_id": { "type": ["string", "null"] }
-        },
-        "additionalProperties": false,
-        "notes": "No synchronous_timeout field -- that is context.evaluate-only. A prepared job that fails still resolves to a terminal CompressionResult (never blocks context.resolve indefinitely)."
-      },
-      "response": {
-        "type": "object",
-        "required": ["job_id"],
-        "properties": { "job_id": { "type": "string" } },
-        "status_code": 202
-      },
-      "possible_outcomes": { "note": "This operation itself never reports a compression Outcome -- only a 202 with a job_id, or a 400 for a malformed request. Its eventual result surfaces later through context.resolve." }
-    },
-
-    "context.resolve": {
-      "summary": "Resolve a job previously created by context.prepare (or, less commonly, one context.evaluate itself registered) at a caller's own safe boundary (§12 -- this interface has no opinion on what a safe boundary is).",
-      "binding": { "method": "GET", "path": "/v1/context/resolve/{job_id}" },
-      "request": {
-        "path_parameters": { "job_id": { "type": "string", "required": true, "description": "As returned by context.prepare's response." } }
-      },
-      "response": {
-        "pending": {
-          "meaning": "The job exists but has not yet reached a terminal state (still QUEUED or RUNNING). This is NOT an error case.",
-          "status_code": 200,
-          "body": { "type": "object", "required": ["status"], "properties": { "status": { "const": "pending" } } }
-        },
-        "terminal": {
-          "meaning": "The job reached a terminal state with a stored result (READY, or one of the non-timeout/non-success failure states -- see acp.jobs.JobState). Same envelope and X-Acp-Outcome requirement as context.evaluate's response.",
-          "$ref": "#/definitions/compression_result_envelope"
-        },
-        "unknown_job_id": {
-          "meaning": "The job_id is unknown (never existed, or was already reclaimed by the coordinator's own stale-job sweep). Treated identically to 'pending' -- interface v1 does not distinguish 'never existed' from 'still in flight' at this operation, since a caller has no actionable difference in response to either.",
-          "status_code": 200,
-          "body": { "type": "object", "required": ["status"], "properties": { "status": { "const": "pending" } } }
-        }
+        "rationale": "Mirrors agent-api-lane-protocol/interface/v1/contract.json's request.forward.response.x_aalp_outcome_header requirement exactly: status code alone cannot always unambiguously identify which outcome produced a given response (multiple outcomes share status code 504 or 502), so X-Acp-Outcome must be present on every context.evaluate response, success or not."
       },
       "possible_outcomes": [
         "success", "unavailable", "queue_timeout", "compression_timeout",
@@ -285,13 +231,13 @@
         "provenance": { "anyOf": [{ "$ref": "#/definitions/provenance" }, { "type": "null" }] }
       },
       "additionalProperties": false,
-      "description": "Serializes acp.compressor.CompressionResult verbatim. Used identically by context.evaluate's response and context.resolve's terminal response."
+      "description": "Serializes acp.compressor.CompressionResult verbatim. Used by context.evaluate's response."
     }
   },
 
   "compatibility": {
     "versioning": "Interface major versions are protocol-local to ACP; they need not match AALP's or ADP's interface version numbers.",
-    "current_version": 1,
+    "current_version": 2,
     "stays_within_current_major_version_when_all_of": [
       "existing valid requests remain valid",
       "existing outcomes retain their documented meaning",
