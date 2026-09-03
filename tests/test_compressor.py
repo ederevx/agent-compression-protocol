@@ -6,7 +6,7 @@ from pathlib import Path
 import json as _json
 
 from acp.aalp_client import AalpClient
-from acp.compressor import Compressor, FailurePolicy, _build_request_body
+from acp.compressor import Compressor, FailurePolicy, _build_request_body, _compute_max_tokens
 from acp.errors import Outcome, TrafficClass
 from acp.provenance import compute_hash
 from acp.telemetry import Telemetry
@@ -19,13 +19,17 @@ _BIG_PAYLOAD_B = "a different big payload body " * 1500
 _SMALL_PAYLOAD = "tiny payload"
 
 
-def _compressor_body(mode: str, text: str = "", usage: dict | None = None) -> bytes:
+def _compressor_body(
+    mode: str, text: str = "", usage: dict | None = None, stop_reason: str | None = None
+) -> bytes:
     content_text = f"ACP-MODE: {mode}"
     if text or mode != "PASS":
         content_text += "\n\n" + text
     obj: dict = {"content": [{"type": "text", "text": content_text}]}
     if usage is not None:
         obj["usage"] = usage
+    if stop_reason is not None:
+        obj["stop_reason"] = stop_reason
     return json.dumps(obj).encode("utf-8")
 
 
@@ -181,6 +185,116 @@ class SuccessParsingTest(CompressorTestCase):
         self.assertIs(result.outcome, Outcome.SUCCESS)
         self.assertEqual(self.telemetry.get("compression_input_tokens"), len(_BIG_PAYLOAD) // 4)
         self.assertEqual(self.telemetry.get("compression_output_tokens"), 40 // 4)
+
+
+class MaxTokensCapTest(unittest.TestCase):
+    """`_compute_max_tokens` must never request more than half of a
+    payload's own estimated input tokens -- the architectural >=50%
+    reduction guarantee, not just an advisory ceiling."""
+
+    def test_boundary_input_just_above_bypass_stays_within_half(self) -> None:
+        # Old logic (min(ceiling, input)) gave 4096/8001 =~ 51.19%, i.e.
+        # LESS than 50% was cut -- the exact gap this cap closes.
+        max_tokens = _compute_max_tokens(8001, 4096)
+        self.assertLessEqual(max_tokens, 8001 // 2)
+        self.assertEqual(max_tokens, 4000)
+
+    def test_half_of_input_binds_when_ceiling_is_higher(self) -> None:
+        max_tokens = _compute_max_tokens(20000, 100000)
+        self.assertEqual(max_tokens, 10000)
+
+    def test_ceiling_still_binds_when_lower_than_half(self) -> None:
+        max_tokens = _compute_max_tokens(50000, 4096)
+        self.assertEqual(max_tokens, 4096)
+
+    def test_floor_still_applies_for_tiny_input(self) -> None:
+        max_tokens = _compute_max_tokens(100, 4096)
+        self.assertEqual(max_tokens, 256)
+
+
+class MaxTokensCapWiringTest(CompressorTestCase):
+    """The 50% cap must actually reach the outbound AALP request body,
+    not just the helper function -- covered end-to-end so a future
+    refactor that breaks the wiring still fails this test."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        # A high ceiling isolates the half-of-input cap as the binding
+        # constraint (the default ceiling of 4096 would otherwise mask
+        # it for this payload size).
+        self.compressor = Compressor(
+            self.client, self.telemetry, max_tokens_ceiling=1_000_000
+        )
+
+    def test_outbound_max_tokens_is_half_of_estimated_input(self) -> None:
+        self._add_ci_provider()
+        self.fake.program_response(
+            "ci", "/v1/messages", outcome="success",
+            body=_compressor_body("COMPACT", "ok"),
+        )
+        self.compressor.compress(_BIG_PAYLOAD, TrafficClass.GENERAL)
+        sent_body = _json.loads(self.fake.last_body)
+        estimated_input_tokens = len(_BIG_PAYLOAD) // 4
+        self.assertEqual(sent_body["max_tokens"], estimated_input_tokens // 2)
+        self.assertLessEqual(sent_body["max_tokens"], estimated_input_tokens // 2)
+
+
+class TruncatedResponseTest(CompressorTestCase):
+    """A response cut off before finishing COMPACT/COMPRESS output
+    (`stop_reason: "max_tokens"`) is a real, newly-introduced risk from
+    tightening the cap -- it must surface as a visible, reason-specific
+    failure (INVALID_RESPONSE -> the usual failure policy), never as
+    silently-accepted partial output."""
+
+    def test_truncated_compact_response_is_invalid_response(self) -> None:
+        self._add_ci_provider()
+        self.fake.program_response(
+            "ci", "/v1/messages", outcome="success",
+            body=_compressor_body(
+                "COMPACT", "cut off mid-sen", stop_reason="max_tokens",
+            ),
+        )
+        result = self.compressor.compress(_BIG_PAYLOAD, TrafficClass.GENERAL)
+        self.assertIs(result.outcome, Outcome.INVALID_RESPONSE)
+        self.assertEqual(result.output, _BIG_PAYLOAD)  # default policy: PASSTHROUGH
+
+    def test_truncated_compress_response_is_invalid_response(self) -> None:
+        self._add_ci_provider()
+        self.fake.program_response(
+            "ci", "/v1/messages", outcome="success",
+            body=_compressor_body(
+                "COMPRESS", "cut off mid-capsule", stop_reason="max_tokens",
+            ),
+        )
+        result = self.compressor.compress(_BIG_PAYLOAD, TrafficClass.GENERAL)
+        self.assertIs(result.outcome, Outcome.INVALID_RESPONSE)
+
+    def test_truncated_pass_response_is_exempt_and_still_succeeds(self) -> None:
+        # PASS always discards the model's trailing text and substitutes
+        # the original payload verbatim, so a truncated PASS body cannot
+        # corrupt anything downstream -- it must not be treated as a
+        # failure.
+        self._add_ci_provider()
+        self.fake.program_response(
+            "ci", "/v1/messages", outcome="success",
+            body=_compressor_body("PASS", stop_reason="max_tokens"),
+        )
+        result = self.compressor.compress(_BIG_PAYLOAD, TrafficClass.GENERAL)
+        self.assertIs(result.outcome, Outcome.SUCCESS)
+        self.assertEqual(result.mode, "PASS")
+        self.assertEqual(result.output, _BIG_PAYLOAD)
+
+    def test_non_truncated_response_with_other_stop_reason_is_unaffected(self) -> None:
+        self._add_ci_provider()
+        self.fake.program_response(
+            "ci", "/v1/messages", outcome="success",
+            body=_compressor_body(
+                "COMPACT", "complete text", stop_reason="end_turn",
+            ),
+        )
+        result = self.compressor.compress(_BIG_PAYLOAD, TrafficClass.GENERAL)
+        self.assertIs(result.outcome, Outcome.SUCCESS)
+        self.assertEqual(result.output, "complete text")
 
 
 class PassSubstitutionTest(CompressorTestCase):

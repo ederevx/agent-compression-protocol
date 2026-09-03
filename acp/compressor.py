@@ -51,10 +51,10 @@ from acp.warnings import CompressionWarningTracker
 DEFAULT_MODEL = "deepseek-v4-flash"
 
 # Ceiling on the compressed output's `max_tokens`, tunable later. The
-# actual cap used per call is min(this ceiling, the payload's own
+# actual cap used per call is min(this ceiling, half the payload's own
 # estimated token count) -- a reduction stage should not be allowed to
-# ask for more output tokens than its input had, floored so tiny
-# payloads still get a workable budget.
+# ask for more than half its input's tokens back out, floored so tiny
+# payloads still get a workable budget. See `_compute_max_tokens`.
 DEFAULT_MAX_TOKENS_CEILING = 4096
 _MIN_MAX_TOKENS = 256
 
@@ -141,7 +141,22 @@ class CompressionResult(AcpResult):
 
 
 def _compute_max_tokens(estimated_input_tokens: int, ceiling: int) -> int:
-    return max(_MIN_MAX_TOKENS, min(ceiling, estimated_input_tokens))
+    """Cap the compressor's requested `max_tokens` so any actual
+    compression (the INSPECT path -- BYPASS never reaches this) cannot
+    ask for more than half of its own estimated input: an architectural
+    >=50% reduction guarantee, not just an advisory ceiling.
+
+    `estimated_input_tokens // 2` alone would undershoot the floor only
+    for a payload smaller than `2 * _MIN_MAX_TOKENS` estimated tokens;
+    every built-in traffic class's `bypass_max` (gate.py) is well above
+    that, so `_MIN_MAX_TOKENS` never actually binds against the 50%
+    guarantee for a default-threshold payload. A caller-supplied custom
+    threshold letting a much smaller payload reach INSPECT is the one
+    case where the floor could push `max_tokens` back above half its
+    input -- an accepted trade favoring a workable output budget over
+    the ratio for payloads that small.
+    """
+    return max(_MIN_MAX_TOKENS, min(ceiling, estimated_input_tokens // 2))
 
 
 def _build_user_message(
@@ -230,6 +245,22 @@ def _parse_compressor_response(body: bytes) -> tuple[str, str, dict[str, Any] | 
     usage = response_json.get("usage")
     if not isinstance(usage, dict):
         usage = None
+
+    # The tightened `max_tokens` cap in `_compute_max_tokens` (>=50%
+    # reduction guarantee) makes truncation a real, newly-introduced
+    # risk for COMPACT/COMPRESS: a real Anthropic-shaped response cut
+    # off mid-output reports `stop_reason: "max_tokens"`. PASS is exempt
+    # -- its trailing text is always discarded and the original payload
+    # substituted verbatim, so a truncated PASS response cannot corrupt
+    # anything downstream. Treating a truncated COMPACT/COMPRESS body as
+    # a protocol violation (rather than returning the partial text)
+    # keeps compressor failure visible and reason-specific instead of
+    # silently handing back incoherent, cut-off output.
+    if mode != "PASS" and response_json.get("stop_reason") == "max_tokens":
+        raise CompressorProtocolViolation(
+            f"compressor response truncated (stop_reason=max_tokens) before "
+            f"completing its {mode} output"
+        )
 
     return mode, remainder, usage
 
