@@ -36,24 +36,54 @@ process, see `deploy/install.sh` (installs `deploy/acp.service` as a
 `systemd --user` unit, then registers the Claude Code host adapter below
 unless run with `--no-claude-code`).
 
-## Claude Code host adapter
+## Claude Code and Codex host adapters
 
-`acp/adapters/claude_code_bash_mcp.py` is a stdio MCP server exposing one
-`bash` tool: it runs the command and routes its output through a live ACP
-instance's `context.evaluate` before returning it, failing open to the
-command's raw output on any ACP failure (unreachable, error, timeout) --
-see the module's own docstring for why this replaces the `PostToolUse`
-hook design originally planned (`PostToolUse.updatedToolOutput` does not
-exist in real Claude Code).
+`acp/adapters/claude_code_bash_mcp.py` is a host-neutral stdio MCP server
+(despite the name -- it predates the Codex adapter) exposing two tools:
 
-`deploy/claude_code/install.py` installs it: it additively sets
-`mcpServers.acp-bash` in `~/.claude.json` and adds `"Bash"` to
-`permissions.deny` in `~/.claude/settings.json` (the deny rule is what
-makes this MCP tool the only way to run a shell command; Claude Code has
-no "prefer this tool" mechanism). Every other key in both files is left
-untouched. Run with `--dry-run` to preview changes first. This changes
-tool behavior for every Claude Code session on the host it's run on, not
-just this project -- run it deliberately, not as an unattended step.
+- `bash`: runs a shell command and routes its output through a live ACP
+  instance's `context.evaluate` before returning it, failing open to the
+  command's raw output on any ACP failure (unreachable, error, timeout)
+  -- see the module's own docstring for why this replaces the
+  `PostToolUse` hook design originally planned (`PostToolUse.
+  updatedToolOutput`/`updatedMCPToolOutput` does not work on either host
+  for a tool that already succeeded).
+- `report`: the same compression, but for text a caller supplies
+  directly -- a subagent calls this itself, cooperatively, to compress
+  its own large final report or a large inter-teammate message before
+  returning/sending it, since neither host lets a hook intercept and
+  replace that after the fact either (agent_protocols_v1
+  background-compression adjustment §29).
+
+`acp/adapters/hooks/` holds three more Phase 4 pieces, each a small
+host-neutral CLI script (`--agent claude|codex`) invoked as a hook
+subprocess, all failing open (silent no-op) on any ACP error:
+
+- `subagent_report.py`: on `SubagentStart`, injects context telling the
+  subagent about the `report` tool; on `SubagentStop`, fires a
+  best-effort background `context.prepare` cache-warm over the
+  subagent's transcript tail (never a guaranteed compression point --
+  see the module docstring).
+- `precompact_pressure.py`: on `PreCompact`, reports maximum pressure to
+  ACP's `context.pressure`, informing how eager its own proactive
+  preparation is -- never blocks or alters the host's actual compaction.
+- `parent_child_context.py`: on `PreToolUse` matched to the
+  subagent-spawning tool (`Task` on Claude, `spawn_agent` on Codex),
+  compresses only an explicit `<acp-context>...</acp-context>` block in
+  the prompt via `updatedInput`, leaving everything else untouched.
+  Confirmed live on Claude Code (`PreToolUse.updatedInput` does apply to
+  `Task`); unconfirmed on Codex in this environment.
+
+`deploy/claude_code/install.py` and `deploy/codex/install.py` install
+these additively into each host's live config -- `mcpServers.acp-bash`/
+`permissions.deny` (Claude) or `codex mcp add` (Codex), plus the hook
+entries into `hooks.SubagentStart`/`SubagentStop`/`PreCompact` (and,
+with `--with-parent-child-context`, `PreToolUse`). Every other existing
+key/entry (e.g. agent-mem-struct's hooks) is left untouched; re-running
+either script is a no-op once installed. Run with `--dry-run` to preview
+first -- these change tool/hook behavior for every session on the host
+they're run on, not just this project, so run them deliberately, not as
+an unattended step.
 
 ## License
 

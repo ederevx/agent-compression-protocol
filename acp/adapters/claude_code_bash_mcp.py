@@ -1,6 +1,12 @@
-"""A stdio MCP server exposing one tool, `bash`, that runs a shell command
-and passes its output through a live ACP instance before returning it to
-Claude Code -- ACP's Phase 4 host integration for Claude Code.
+"""A stdio MCP server exposing `bash` and `report`, ACP's Phase 4 host
+integration for Claude Code. `bash` runs a shell command and passes its
+output through a live ACP instance before returning it. `report`
+compresses arbitrary caller-supplied text the same way, for a subagent
+that wants to compress its own final report or a large cross-teammate
+message before returning/sending it -- the "cooperative worker-report"
+pattern (agent_protocols_v1 background-compression adjustment §29),
+which exists because neither host can intercept and replace a
+successful tool's or subagent's output after the fact (see below).
 
 Why an MCP tool instead of a `PostToolUse` hook
 ------------------------------------------------
@@ -28,6 +34,15 @@ of the built-in `Bash` tool, with a `Bash` deny rule applying to it too).
 Installing that deny rule in a live, host-wide settings file is a
 separate, explicitly-confirmed step -- see the Phase 4 checkpoint in
 project_md's STATUS.md; this module only implements the tool itself.
+
+`report`: the same "be the tool" reasoning applies to a subagent's final
+report and to inter-teammate messages (Claude Code's Agent Teams
+`SendMessage`) -- `SubagentStop` carries no field a hook could use to
+mutate what the parent sees even where it exists (Codex), and does not
+exist at all as a mutation point on Claude. There is no host mechanism
+to force a subagent to call `report` before returning; a
+`SubagentStart`-injected instruction (see `acp/adapters/hooks/
+subagent_report.py`) is what asks it to, cooperatively.
 
 Fail-open, always
 ------------------
@@ -87,7 +102,24 @@ _TOOLS: list[dict[str, Any]] = [
             },
             "required": ["command"],
         },
-    }
+    },
+    {
+        "name": "report",
+        "description": (
+            "Compress a large final report or inter-teammate message before "
+            "returning/sending it, through ACP. Call this yourself when your "
+            "own report would otherwise be large; ACP being unavailable "
+            "never blocks you or alters the text beyond that compression "
+            "step."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "The report or message text to compress."},
+            },
+            "required": ["text"],
+        },
+    },
 ]
 
 
@@ -149,6 +181,17 @@ def _evaluate_or_passthrough(
     return result.output, list(result.warnings)
 
 
+def _store_source_best_effort(client: AcpClient, content: str) -> None:
+    """Register raw provenance for `content` ahead of compressing it.
+    Best-effort: a failure here must never block the actual `report` call
+    -- the source hash is only ever a nicety for later traceability, not
+    something this tool's own output depends on."""
+    try:
+        client.store_source(content.encode("utf-8"))
+    except Exception:
+        pass
+
+
 def _text_result(text: str, *, is_error: bool = False) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": text}], "isError": is_error}
 
@@ -187,22 +230,36 @@ class BashMcpServer:
             params = message.get("params") or {}
             name = params.get("name")
             arguments = params.get("arguments") or {}
-            if name != "bash":
-                return {
-                    "jsonrpc": "2.0", "id": request_id,
-                    "result": _text_result(f"unknown tool: {name!r}", is_error=True),
-                }
-            command = arguments.get("command")
-            if not isinstance(command, str) or not command:
-                return {
-                    "jsonrpc": "2.0", "id": request_id,
-                    "result": _text_result("'command' must be a non-empty string", is_error=True),
-                }
-            timeout_seconds = _resolve_timeout_seconds(arguments.get("timeout"))
-            raw_output = run_bash(command, timeout_seconds)
-            final_output, _warnings = _evaluate_or_passthrough(
-                self._client, raw_output, self._session_id)
-            return {"jsonrpc": "2.0", "id": request_id, "result": _text_result(final_output)}
+
+            if name == "bash":
+                command = arguments.get("command")
+                if not isinstance(command, str) or not command:
+                    return {
+                        "jsonrpc": "2.0", "id": request_id,
+                        "result": _text_result("'command' must be a non-empty string", is_error=True),
+                    }
+                timeout_seconds = _resolve_timeout_seconds(arguments.get("timeout"))
+                raw_output = run_bash(command, timeout_seconds)
+                final_output, _warnings = _evaluate_or_passthrough(
+                    self._client, raw_output, self._session_id)
+                return {"jsonrpc": "2.0", "id": request_id, "result": _text_result(final_output)}
+
+            if name == "report":
+                text = arguments.get("text")
+                if not isinstance(text, str) or not text:
+                    return {
+                        "jsonrpc": "2.0", "id": request_id,
+                        "result": _text_result("'text' must be a non-empty string", is_error=True),
+                    }
+                _store_source_best_effort(self._client, text)
+                final_text, _warnings = _evaluate_or_passthrough(
+                    self._client, text, self._session_id)
+                return {"jsonrpc": "2.0", "id": request_id, "result": _text_result(final_text)}
+
+            return {
+                "jsonrpc": "2.0", "id": request_id,
+                "result": _text_result(f"unknown tool: {name!r}", is_error=True),
+            }
 
         # Unknown method: only reply with an error if it expected a response
         # (has an id) -- never talk back on an unrecognized notification.

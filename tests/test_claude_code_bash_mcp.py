@@ -13,6 +13,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from acp.adapters.claude_code_bash_mcp import BashMcpServer, run_bash
 from acp.serve import build_ingress
@@ -60,8 +61,9 @@ class BashMcpServerProtocolTest(unittest.TestCase):
         response = self.server.handle_message(
             {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
         names = [tool["name"] for tool in response["result"]["tools"]]
-        self.assertEqual(names, ["bash"])
+        self.assertEqual(names, ["bash", "report"])
         self.assertIn("command", response["result"]["tools"][0]["inputSchema"]["properties"])
+        self.assertIn("text", response["result"]["tools"][1]["inputSchema"]["properties"])
 
     def test_unknown_tool_call_returns_is_error(self) -> None:
         response = self.server.handle_message({
@@ -76,6 +78,33 @@ class BashMcpServerProtocolTest(unittest.TestCase):
             "params": {"name": "bash", "arguments": {}},
         })
         self.assertTrue(response["result"]["isError"])
+
+    def test_missing_text_argument_returns_is_error(self) -> None:
+        response = self.server.handle_message({
+            "jsonrpc": "2.0", "id": 41, "method": "tools/call",
+            "params": {"name": "report", "arguments": {}},
+        })
+        self.assertTrue(response["result"]["isError"])
+
+    def test_report_call_with_acp_unreachable_falls_back_to_raw_text(self) -> None:
+        response = self.server.handle_message({
+            "jsonrpc": "2.0", "id": 42, "method": "tools/call",
+            "params": {"name": "report", "arguments": {"text": "a raw report body"}},
+        })
+        self.assertFalse(response["result"]["isError"])
+        self.assertEqual(response["result"]["content"][0]["text"], "a raw report body")
+
+    def test_report_calls_store_source_and_still_succeeds_if_it_fails(self) -> None:
+        with patch.object(
+            self.server._client, "store_source", side_effect=RuntimeError("boom")
+        ) as mock_store:
+            response = self.server.handle_message({
+                "jsonrpc": "2.0", "id": 43, "method": "tools/call",
+                "params": {"name": "report", "arguments": {"text": "a raw report body"}},
+            })
+        mock_store.assert_called_once_with("a raw report body".encode("utf-8"))
+        self.assertFalse(response["result"]["isError"])
+        self.assertEqual(response["result"]["content"][0]["text"], "a raw report body")
 
     def test_unknown_method_with_id_returns_json_rpc_error(self) -> None:
         response = self.server.handle_message(
@@ -160,6 +189,28 @@ class BashMcpServerRealAcpTest(unittest.TestCase):
         })
         self.assertFalse(response["result"]["isError"])
         self.assertIn("still-works", response["result"]["content"][0]["text"])
+
+    def test_small_report_text_bypasses_unchanged(self) -> None:
+        response = self.server.handle_message({
+            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": {"name": "report", "arguments": {"text": "small report body"}},
+        })
+        self.assertFalse(response["result"]["isError"])
+        self.assertEqual(response["result"]["content"][0]["text"], "small report body")
+
+    def test_large_report_text_is_compressed_via_real_acp_roundtrip(self) -> None:
+        self.fake.program_response(
+            "ci", "/v1/messages", outcome="success",
+            body=_compressor_body("COMPACT", "shrunk-report"),
+        )
+        big_report = "subagent finding line " * 1600
+        response = self.server.handle_message({
+            "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+            "params": {"name": "report", "arguments": {"text": big_report}},
+        })
+        self.assertFalse(response["result"]["isError"])
+        self.assertEqual(response["result"]["content"][0]["text"], "shrunk-report")
+
 
 
 if __name__ == "__main__":

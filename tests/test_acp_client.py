@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -86,6 +87,42 @@ class AcpClientEndToEndTest(unittest.TestCase):
         client._secret = "wrong-secret"
         with self.assertRaises(AcpProtocolError):
             client.evaluate(_SMALL_PAYLOAD, "general", self._receiver())
+
+    def test_prepare_returns_job_id_and_resolve_is_pending_then_terminal(self) -> None:
+        self.fake.program_response(
+            "ci", "/v1/messages", outcome="success",
+            body=_compressor_body("COMPACT", "shrunk-prepared-output"),
+        )
+        job_id = self.client.prepare(_BIG_PAYLOAD, "general", self._receiver())
+        self.assertTrue(job_id)
+
+        deadline = time.monotonic() + 5.0
+        result = None
+        while time.monotonic() < deadline:
+            result = self.client.resolve(job_id)
+            if result is not None:
+                break
+            time.sleep(0.02)
+        self.assertIsNotNone(result)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.output, "shrunk-prepared-output")
+
+    def test_resolve_unknown_job_id_returns_none(self) -> None:
+        self.assertIsNone(self.client.resolve("no-such-job"))
+
+    def test_report_pressure_returns_mode_name(self) -> None:
+        mode = self.client.report_pressure(self._receiver(), 0.9)
+        self.assertEqual(mode, "above_emergency")
+
+    def test_report_pressure_rejects_out_of_range_ratio(self) -> None:
+        with self.assertRaises(AcpProtocolError):
+            self.client.report_pressure(self._receiver(), 5.0)
+
+    def test_store_source_returns_content_addressed_hash(self) -> None:
+        first = self.client.store_source(b"identical content")
+        second = self.client.store_source(b"identical content")
+        self.assertTrue(first)
+        self.assertEqual(first, second)
 
 
 if __name__ == "__main__":

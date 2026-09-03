@@ -11,11 +11,18 @@ other in-process module. This keeps a host adapter honest about running
 as a separate process talking to ACP's real interface boundary, the same
 way ACP itself never reaches into AALP's internals.
 
-Only `context.evaluate` is implemented -- the one operation a host
-adapter needs for its immediate-compression boundary (see
-`claude_code_bash_mcp.py`'s module docstring for why no
+All six interface v1 operations `Coordinator` implements are reachable
+here except `service.capabilities`/`service.status` (a host adapter has
+no need for either): `evaluate` (the synchronous immediate-compression
+boundary; see `claude_code_bash_mcp.py`'s module docstring for why no
 `PostToolUse`-hook-based boundary exists in real Claude Code, and why an
-MCP tool wrapper is the adapter shape instead).
+MCP tool wrapper is the adapter shape instead), plus `prepare`/`resolve`
+(background job submission/polling, for proactive/prewarm use from a
+`SubagentStop`-style hook), `report_pressure` (feeds ACP's own
+`acp/pressure.py` state machine from a `PreCompact`-style hook), and
+`store_source` (raw provenance registration ahead of an `evaluate`/
+`prepare` call on the same content, for the cooperative worker-report
+pattern -- agent_protocols_v1 background-compression adjustment §29).
 """
 from __future__ import annotations
 
@@ -157,44 +164,35 @@ class AcpClient:
             raise
         return sock
 
-    def evaluate(
+    def _call(
         self,
-        payload: str,
-        traffic_class: str,
-        receiver: dict[str, str | None],
+        method: str,
+        path: str,
+        raw_body: bytes,
         *,
-        flow_id: str | None = None,
-        synchronous_timeout: float | None = None,
-        timeout: float = 30.0,
-    ) -> AcpEvaluateResult:
-        """`POST /v1/context/evaluate`. Raises `AcpBootstrapError`/
-        `AcpProtocolError`/`socket.timeout`/`OSError` on anything short of
-        a well-formed response -- callers embedding this in a host adapter
-        must treat any of those as "ACP unreachable" and fall back to the
-        original, uncompressed payload rather than block or corrupt a
-        tool result (see `claude_code_bash_mcp.py`)."""
+        content_type: str,
+        timeout: float,
+    ) -> tuple[int, bytes]:
+        """Send one request envelope over a fresh connection, return
+        `(status, response_body_bytes)`. Every public method's own
+        exception discipline (see `evaluate`'s docstring) starts here:
+        raises `AcpBootstrapError`/`AcpProtocolError`/`socket.timeout`/
+        `OSError` on anything short of a well-formed transport-level
+        response; a non-2xx/202 `status` is returned, not raised, since
+        each caller maps its own operation's status codes."""
         self._ensure_bootstrapped()
 
         deadline = time.monotonic() + timeout
         sock = self._connect(timeout)
         try:
-            body: dict[str, Any] = {
-                "payload": payload,
-                "traffic_class": traffic_class,
-                "receiver": receiver,
-            }
-            if flow_id is not None:
-                body["flow_id"] = flow_id
-            if synchronous_timeout is not None:
-                body["synchronous_timeout"] = synchronous_timeout
             envelope = json.dumps({
-                "method": "POST",
-                "path": "/v1/context/evaluate",
+                "method": method,
+                "path": path,
                 "headers": {
                     "Authorization": f"Bearer {self._secret}",
-                    "Content-Type": "application/json",
+                    "Content-Type": content_type,
                 },
-                "body": base64.b64encode(json.dumps(body).encode("utf-8")).decode("ascii"),
+                "body": base64.b64encode(raw_body).decode("ascii"),
             }).encode("utf-8")
             _write_frame(sock, envelope, deadline)
             response_payload = _read_frame(sock, deadline, _MAX_RESPONSE_FRAME_BYTES)
@@ -204,14 +202,18 @@ class AcpClient:
         try:
             response = json.loads(response_payload.decode("utf-8"))
             status = response["status"]
-            raw_body = response.get("body") or ""
-            response_body = base64.b64decode(raw_body) if raw_body else b""
+            raw_response_body = response.get("body") or ""
+            response_body = base64.b64decode(raw_response_body) if raw_response_body else b""
         except Exception as exc:
             raise AcpProtocolError(f"malformed ACP response envelope: {exc}") from exc
 
         if status == 401:
             raise AcpProtocolError("ACP rejected this adapter's bearer secret (401)")
 
+        return status, response_body
+
+    @staticmethod
+    def _parse_result_body(response_body: bytes) -> AcpEvaluateResult:
         try:
             parsed = json.loads(response_body)
         except json.JSONDecodeError as exc:
@@ -230,3 +232,135 @@ class AcpClient:
             message=parsed.get("message", ""),
             provenance=parsed.get("provenance"),
         )
+
+    def evaluate(
+        self,
+        payload: str,
+        traffic_class: str,
+        receiver: dict[str, str | None],
+        *,
+        flow_id: str | None = None,
+        synchronous_timeout: float | None = None,
+        timeout: float = 30.0,
+    ) -> AcpEvaluateResult:
+        """`POST /v1/context/evaluate`. Raises `AcpBootstrapError`/
+        `AcpProtocolError`/`socket.timeout`/`OSError` on anything short of
+        a well-formed response -- callers embedding this in a host adapter
+        must treat any of those as "ACP unreachable" and fall back to the
+        original, uncompressed payload rather than block or corrupt a
+        tool result (see `claude_code_bash_mcp.py`)."""
+        body: dict[str, Any] = {
+            "payload": payload,
+            "traffic_class": traffic_class,
+            "receiver": receiver,
+        }
+        if flow_id is not None:
+            body["flow_id"] = flow_id
+        if synchronous_timeout is not None:
+            body["synchronous_timeout"] = synchronous_timeout
+        _status, response_body = self._call(
+            "POST", "/v1/context/evaluate",
+            json.dumps(body).encode("utf-8"),
+            content_type="application/json", timeout=timeout,
+        )
+        return self._parse_result_body(response_body)
+
+    def prepare(
+        self,
+        payload: str,
+        traffic_class: str,
+        receiver: dict[str, str | None],
+        *,
+        urgency: str = "prefetch",
+        flow_id: str | None = None,
+        timeout: float = 30.0,
+    ) -> str:
+        """`POST /v1/context/prepare`. Enqueues a background compression
+        job and returns its `job_id` immediately (202) -- never blocks on
+        the job itself. `urgency` is `"prefetch"` (opportunistic, e.g. a
+        `SubagentStop` cache warm) or `"maintenance"` per interface v1.
+        Same exception discipline as `evaluate`: any raised exception
+        means "ACP unreachable," and callers here are expected to treat a
+        failed prewarm as a no-op, not a fatal error."""
+        body: dict[str, Any] = {
+            "payload": payload,
+            "traffic_class": traffic_class,
+            "receiver": receiver,
+            "urgency": urgency,
+        }
+        if flow_id is not None:
+            body["flow_id"] = flow_id
+        status, response_body = self._call(
+            "POST", "/v1/context/prepare",
+            json.dumps(body).encode("utf-8"),
+            content_type="application/json", timeout=timeout,
+        )
+        if status != 202:
+            raise AcpProtocolError(f"ACP context.prepare returned unexpected status {status}")
+        try:
+            parsed = json.loads(response_body)
+            return parsed["job_id"]
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise AcpProtocolError(f"ACP context.prepare response missing 'job_id': {exc}") from exc
+
+    def resolve(self, job_id: str, *, timeout: float = 30.0) -> AcpEvaluateResult | None:
+        """`GET /v1/context/resolve/{job_id}`. `None` while the job is
+        still in flight (or unknown to ACP); a terminal result otherwise.
+        Polling cadence and what counts as a "safe boundary" to call this
+        at are entirely the caller's decision -- this method only speaks
+        the wire protocol."""
+        status, response_body = self._call(
+            "GET", f"/v1/context/resolve/{job_id}",
+            b"", content_type="application/json", timeout=timeout,
+        )
+        try:
+            parsed = json.loads(response_body)
+        except json.JSONDecodeError as exc:
+            raise AcpProtocolError(f"ACP context.resolve response is not valid JSON: {exc}") from exc
+        if parsed.get("status") == "pending":
+            return None
+        return self._parse_result_body(response_body)
+
+    def report_pressure(
+        self,
+        receiver: dict[str, str | None],
+        observed_ratio: float,
+        *,
+        timeout: float = 10.0,
+    ) -> str:
+        """`POST /v1/context/pressure`. Reports how close `receiver` is to
+        its native auto-compaction boundary; returns the resulting
+        `PressureMode` name, lowercased (`"below_soft"`,
+        `"soft_to_hard"`, `"hard_to_emergency"`, `"above_emergency"`) --
+        purely informational to ACP's own proactive-preparation state,
+        never a signal that blocks or alters host compaction itself."""
+        body = {"receiver": receiver, "observed_ratio": observed_ratio}
+        _status, response_body = self._call(
+            "POST", "/v1/context/pressure",
+            json.dumps(body).encode("utf-8"),
+            content_type="application/json", timeout=timeout,
+        )
+        try:
+            parsed = json.loads(response_body)
+            return parsed["mode"]
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise AcpProtocolError(f"ACP context.pressure response missing 'mode': {exc}") from exc
+
+    def store_source(self, content: bytes, *, timeout: float = 30.0) -> str:
+        """`POST /v1/source/store`. Raw binary body, not JSON -- mirrors
+        `_handle_store` in `acp/http_api.py`, which reads the request body
+        directly rather than parsing it as a JSON envelope. Returns the
+        resulting `source_hash` for later reference (e.g. as
+        `prior_provenance.source_hash` on a subsequent `evaluate`/
+        `prepare` call for the same content)."""
+        status, response_body = self._call(
+            "POST", "/v1/source/store", content,
+            content_type="application/octet-stream", timeout=timeout,
+        )
+        if status != 201:
+            raise AcpProtocolError(f"ACP source.store returned unexpected status {status}")
+        try:
+            parsed = json.loads(response_body)
+            return parsed["source_hash"]
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise AcpProtocolError(f"ACP source.store response missing 'source_hash': {exc}") from exc
