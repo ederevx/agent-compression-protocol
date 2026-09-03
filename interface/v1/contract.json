@@ -12,11 +12,12 @@
     "context.resolve",
     "context.pressure",
     "source.store",
-    "service.status"
+    "service.status",
+    "service.telemetry"
   ],
 
   "excluded_from_this_interface": {
-    "coordinator.internal_state": "Job dict internals, cache keys/entries, and lock state are never exposed in any form. service.status is a bounded, aggregated view only (job counts by state, AALP reachability, a pressure-mode snapshot) -- see its response schema below.",
+    "coordinator.internal_state": "Job dict internals, cache keys/entries, and lock state are never exposed in any form. service.status is a bounded, aggregated view only (job counts by state, AALP reachability, a pressure-mode snapshot) -- see its response schema below. service.telemetry is likewise bounded and aggregated: it exposes only the named, pre-registered integer counters from acp.telemetry.COUNTER_NAMES (verbatim Telemetry.snapshot()), never a raw payload, credential, or per-job/per-cache-entry detail, so it does not fall under this exclusion.",
     "raw_source.read": "source.store registers raw authoritative content addressed by its hash for provenance/audit purposes only. There is no operation in this interface to read stored raw bytes back out; a host adapter that needs the original payload again must already hold it (ACP never becomes the system of record for retrieving raw source).",
     "provider_credential.any": "ACP never holds or exposes an AALP provider credential in any form -- credentials remain AALP-owned administrative functionality, entirely outside ACP's own interface (see agent-api-lane-protocol/interface/v1/contract.json's own exclusion of credential.read/write/probe)."
   },
@@ -45,7 +46,8 @@
   "transport_binding": {
     "normative_for": [
       "context.evaluate", "context.prepare", "context.resolve",
-      "context.pressure", "source.store", "service.capabilities", "service.status"
+      "context.pressure", "source.store", "service.capabilities", "service.status",
+      "service.telemetry"
     ],
     "notes": "Every operation below is this interface's own concrete, normative wire binding -- there is no separate private implementation to reconcile against, unlike AALP's request.forward (which formalizes an already-implemented protocol). A conforming ACP service and a conforming fake service used for host-adapter client tests must both implement this binding exactly as described. Mirrors agent-api-lane-protocol/interface/v1/contract.json's own wire_protocol exactly.",
     "wire_protocol": {
@@ -257,6 +259,25 @@
           "any AALP bearer secret or other credential",
           "job internals beyond a per-state count (no per-job detail is exposed)"
         ]
+      },
+      "possible_outcomes": { "note": "Not modeled with the compression Outcome enum. Always 200 on a reachable, authenticated call." }
+    },
+
+    "service.telemetry": {
+      "summary": "Externally observable snapshot of ACP's own telemetry counters (agent_protocols_v1_metadata_v1.md §21) -- directly acp.telemetry.Telemetry.snapshot()'s own return value for the live Coordinator instance. Added additively in interface v1 (§8): existing operations, fields, and outcomes are unchanged; a client that does not adopt this capability continues working exactly as before.",
+      "binding": { "method": "GET", "path": "/v1/service/telemetry" },
+      "request": { "type": "object", "properties": {}, "additionalProperties": false },
+      "response": {
+        "type": "object",
+        "required": ["counters"],
+        "properties": {
+          "counters": {
+            "type": "object",
+            "additionalProperties": { "type": "integer" },
+            "description": "Every name in acp.telemetry.COUNTER_NAMES, mapped to its current integer value. Aggregate counts only -- never a raw payload, compressed output, credential, or per-job/per-cache-entry detail (see excluded_from_this_interface.coordinator.internal_state)."
+          }
+        },
+        "additionalProperties": false
       },
       "possible_outcomes": { "note": "Not modeled with the compression Outcome enum. Always 200 on a reachable, authenticated call." }
     }
