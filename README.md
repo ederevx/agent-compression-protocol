@@ -19,6 +19,18 @@ ACP is one of three protocols defined in `agent_protocols_v1`:
 See the `agent_protocols_v1` project metadata for the full architecture
 and implementation phases.
 
+## Running ACP
+
+Run ACP as a standalone process with `python -m acp` (see `acp/serve.py`);
+it constructs `acp.coordinator.Coordinator` from `--aalp-root`/`--root`
+and starts `acp.ingress.Ingress` on it, publishing
+`.acp/state/ingress.json` + `.acp/state/ingress.secret` for a client to
+bootstrap against (see `interface/v1/README.md`'s Bootstrap section).
+`--aalp-root` (or the `AALP_HOME` environment variable) is required --
+it points at the AALP instance ACP compresses through, and ACP never
+guesses a sibling directory for it. `--root`, `--host`, and `--port`
+override the `ACP_HOME`-derived/default values.
+
 ## License
 
 CC BY 4.0 — see [LICENSE](LICENSE).
