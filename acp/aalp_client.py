@@ -252,36 +252,6 @@ class AalpClient:
         self._capabilities = data
         return data
 
-    # -- provider.status ----------------------------------------------------
-
-    def provider_status(self, provider_id: str | None = None) -> Any:
-        """`GET /_aalp/v1/providers[/{provider_id}]`.
-
-        Returns the list of provider-status objects when `provider_id` is
-        omitted, a single provider-status object when it is given and
-        known, or `None` when it is given and unknown (AALP's 404).
-        """
-        self._ensure_bootstrapped()
-        if provider_id is None:
-            status, body = self._discovery_request("GET", "/_aalp/v1/providers")
-            if status != 200:
-                raise AalpProtocolError(
-                    f"provider.status (list) returned unexpected status {status}"
-                )
-            data = self._parse_json(body, context="provider.status")
-            return data["providers"]
-
-        status, body = self._discovery_request(
-            "GET", f"/_aalp/v1/providers/{provider_id}"
-        )
-        if status == 404:
-            return None
-        if status != 200:
-            raise AalpProtocolError(
-                f"provider.status({provider_id!r}) returned unexpected status {status}"
-            )
-        return self._parse_json(body, context="provider.status")
-
     def _discovery_request(self, method: str, path: str) -> tuple[int, bytes]:
         deadline = time.monotonic() + _DISCOVERY_TIMEOUT_SECONDS
         try:

@@ -8,7 +8,6 @@ import json as _json
 from acp.aalp_client import AalpClient
 from acp.compressor import (
     Compressor,
-    FailurePolicy,
     _build_request_body,
     _compute_max_tokens,
     _compute_target_tokens,
@@ -73,50 +72,6 @@ class BypassTest(CompressorTestCase):
         )
         self.assertEqual(self.telemetry.get("compression_attempts"), 0)
         self.assertTrue(result.provenance.processed)
-
-
-class AntiRecursionTest(CompressorTestCase):
-    def test_same_payload_skips_second_aalp_call(self) -> None:
-        self._add_ci_provider()
-        self.fake.program_response(
-            "ci", "/v1/messages", outcome="success",
-            body=_compressor_body("COMPACT", "shrunk"),
-        )
-
-        first = self.compressor.compress(_BIG_PAYLOAD, TrafficClass.GENERAL)
-        self.assertIs(first.outcome, Outcome.SUCCESS)
-
-        # only one response was programmed; a second real call would
-        # raise. This must not raise.
-        second = self.compressor.compress(
-            _BIG_PAYLOAD, TrafficClass.GENERAL, prior_provenance=first.provenance
-        )
-        self.assertIs(second.outcome, Outcome.SUCCESS)
-        self.assertEqual(second.output, _BIG_PAYLOAD)
-        self.assertEqual(second.provenance, first.provenance)
-        # anti-recursion short-circuit increments no telemetry itself
-        self.assertEqual(self.telemetry.get("compression_attempts"), 1)
-
-    def test_new_payload_after_prior_is_reevaluated(self) -> None:
-        self._add_ci_provider()
-        self.fake.program_response(
-            "ci", "/v1/messages", outcome="success",
-            body=_compressor_body("COMPACT", "shrunk-a"),
-        )
-        self.fake.program_response(
-            "ci", "/v1/messages", outcome="success",
-            body=_compressor_body("COMPACT", "shrunk-b"),
-        )
-
-        first = self.compressor.compress(_BIG_PAYLOAD, TrafficClass.GENERAL)
-        second = self.compressor.compress(
-            _BIG_PAYLOAD_B, TrafficClass.GENERAL, prior_provenance=first.provenance
-        )
-
-        self.assertIs(second.outcome, Outcome.SUCCESS)
-        self.assertEqual(second.output, "shrunk-b")
-        self.assertEqual(second.provenance.generation, first.provenance.generation + 1)
-        self.assertEqual(self.telemetry.get("compression_attempts"), 2)
 
 
 class SuccessParsingTest(CompressorTestCase):
@@ -503,92 +458,6 @@ class FailureOutcomeTest(CompressorTestCase):
         self.assertIs(result.outcome, Outcome.INVALID_RESPONSE)
         self.assertEqual(self.telemetry.get("compression_availability"), 1)
 
-    def test_block_policy_withholds_original_payload(self) -> None:
-        self._program_failure("total_timeout")
-        result = self.compressor.compress(
-            _BIG_PAYLOAD, TrafficClass.GENERAL, force_policy=FailurePolicy.BLOCK
-        )
-        self.assertIs(result.outcome, Outcome.TOTAL_TIMEOUT)
-        self.assertNotIn(_BIG_PAYLOAD, result.output)
-        self.assertIn("blocked", result.output)
-        self.assertEqual(self.telemetry.get("compression_timeout_blocked_payloads"), 1)
-        self.assertEqual(self.telemetry.get("compression_timeout_bypass_tokens"), 0)
-        self.assertEqual(len(result.warnings), 1)
-        self.assertIn("blocked instead of exposed", result.warnings[0])
-
-    def test_block_via_size_threshold(self) -> None:
-        self._program_failure("upstream_error")
-        result = self.compressor.compress(
-            _BIG_PAYLOAD, TrafficClass.GENERAL, prior_provenance=None,
-        )
-        # default threshold is None -> PASSTHROUGH even for a big payload
-        self.assertEqual(result.output, _BIG_PAYLOAD)
-
-
-class NativeFallbackNeverIncrementedTest(CompressorTestCase):
-    """§33/§17: `native_compression_fallbacks` must always read zero --
-
-    ACP has no code path that calls native Claude/Codex inference on
-    external-compressor failure (see `acp/compressor.py`'s module
-    docstring and `_handle_failure`, which only ever returns the
-    original payload verbatim -- PASSTHROUGH -- or a fixed, non-model
-    placeholder string -- BLOCK). This is a regression test, not a
-    restatement of that fact: it drives every failure `Outcome` this
-    compressor can produce through the exact same `compress()` entry
-    point a real caller uses and asserts the counter afterward, so a
-    future change that actually adds a native-fallback call would fail
-    this test (its output would stop matching the deterministic
-    passthrough/placeholder shapes asserted below), not just silently
-    escape a `grep`.
-    """
-
-    _ALL_FAILURE_OUTCOMES = (
-        "unavailable", "queue_timeout", "compression_timeout",
-        "total_timeout", "invalid_response", "upstream_error",
-    )
-
-    def test_stays_zero_across_every_failure_outcome_passthrough(self) -> None:
-        for outcome_name in self._ALL_FAILURE_OUTCOMES:
-            with self.subTest(outcome=outcome_name):
-                # add_provider()/program_response() are idempotent/
-                # appendable per (provider_id, path), so re-calling them
-                # each iteration is safe and needs no fixture reset.
-                self._add_ci_provider()
-                self.fake.program_response(
-                    "ci", "/v1/messages", outcome=outcome_name,
-                    message=f"{outcome_name} happened",
-                )
-                result = self.compressor.compress(_BIG_PAYLOAD, TrafficClass.GENERAL)
-                self.assertEqual(self.telemetry.get("native_compression_fallbacks"), 0)
-                # PASSTHROUGH: the original payload comes back byte-for-
-                # byte, which could not be true of anything a second
-                # (native) model call had generated.
-                self.assertEqual(result.output, _BIG_PAYLOAD)
-
-    def test_stays_zero_when_block_policy_withholds_payload(self) -> None:
-        self._add_ci_provider()
-        self.fake.program_response(
-            "ci", "/v1/messages", outcome="total_timeout", message="total_timeout happened"
-        )
-        result = self.compressor.compress(
-            _BIG_PAYLOAD, TrafficClass.GENERAL, force_policy=FailurePolicy.BLOCK,
-        )
-        self.assertEqual(self.telemetry.get("native_compression_fallbacks"), 0)
-        # BLOCK: a fixed, non-model placeholder -- never model-generated
-        # replacement content.
-        self.assertNotIn(_BIG_PAYLOAD, result.output)
-        self.assertIn("[ACP: content blocked", result.output)
-
-    def test_stays_zero_after_a_successful_compression_too(self) -> None:
-        self._add_ci_provider()
-        self.fake.program_response(
-            "ci", "/v1/messages", outcome="success",
-            body=_compressor_body("COMPACT", "shrunk"),
-        )
-        self.compressor.compress(_BIG_PAYLOAD, TrafficClass.GENERAL)
-        self.assertEqual(self.telemetry.get("native_compression_fallbacks"), 0)
-
-
 class WarningAggregationTest(CompressorTestCase):
     def test_two_consecutive_failures_warn_once_then_one_recovery(self) -> None:
         self._add_ci_provider()
@@ -599,12 +468,9 @@ class WarningAggregationTest(CompressorTestCase):
         )
 
         first = self.compressor.compress(_BIG_PAYLOAD, TrafficClass.GENERAL)
-        second = self.compressor.compress(
-            _BIG_PAYLOAD_B, TrafficClass.GENERAL, prior_provenance=first.provenance
-        )
+        second = self.compressor.compress(_BIG_PAYLOAD_B, TrafficClass.GENERAL)
         third = self.compressor.compress(
             "yet another distinct big payload " * 1500, TrafficClass.GENERAL,
-            prior_provenance=second.provenance,
         )
 
         self.assertEqual(len(first.warnings), 1)

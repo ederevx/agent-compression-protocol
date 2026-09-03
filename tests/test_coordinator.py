@@ -9,8 +9,6 @@ from acp import containment
 from acp.coordinator import Coordinator
 from acp.errors import Outcome, TrafficClass
 from acp.provenance import compute_hash
-from acp.pressure import PressureController, PressureMode
-from acp.telemetry import Telemetry
 from tests.fixtures.fake_aalp_v1 import FakeAalpV1, FakeProvider
 
 # > 32000 chars -> > 8000 estimated tokens (len // 4) -> GENERAL traffic
@@ -18,7 +16,6 @@ from tests.fixtures.fake_aalp_v1 import FakeAalpV1, FakeProvider
 _BIG_PAYLOAD = "log line filler content " * 1600
 _BIG_PAYLOAD_B = "a different big payload body " * 1500
 _RECEIVER = ("test-host", "session-1", None)
-_RECEIVER_B = ("test-host", "session-2", None)
 
 
 def _compressor_body(mode: str, text: str = "", usage: dict | None = None) -> bytes:
@@ -50,15 +47,6 @@ class CoordinatorTestCase(unittest.TestCase):
         defaults = dict(id="ci", display_name="ci", accepted_paths=["/v1/messages"])
         defaults.update(overrides)
         self.fake.add_provider(FakeProvider(**defaults))
-
-    def _wait_until_resolved(self, job_id: str, timeout: float = 5.0):
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            result = self.coordinator.resolve(job_id)
-            if result is not None:
-                return result
-            time.sleep(0.01)
-        self.fail(f"job {job_id} never reached a resolvable terminal state")
 
 
 class ConcurrentCoalesceTest(CoordinatorTestCase):
@@ -105,106 +93,24 @@ class ConcurrentCoalesceTest(CoordinatorTestCase):
         self.assertLess(elapsed, 2.0)
 
 
-class PrepareResolveTest(CoordinatorTestCase):
-    def test_prepare_then_resolve_returns_ready_result_once_ready(self) -> None:
-        self._add_ci_provider()
-        self.fake.program_response(
-            "ci", "/v1/messages", outcome="success",
-            body=_compressor_body("COMPACT", "prepared"), delay=0.2,
-        )
-
-        job_id = self.coordinator.prepare(_BIG_PAYLOAD, TrafficClass.GENERAL, _RECEIVER)
-        # Almost certainly still in flight immediately after prepare().
-        self.assertIsNone(self.coordinator.resolve(job_id))
-
-        result = self._wait_until_resolved(job_id)
-        self.assertIs(result.outcome, Outcome.SUCCESS)
-        self.assertEqual(result.output, "prepared")
-
-    def test_prepare_reuses_ready_cached_result(self) -> None:
-        self._add_ci_provider()
-        self.fake.program_response(
-            "ci", "/v1/messages", outcome="success",
-            body=_compressor_body("COMPACT", "cached"),
-        )
-
-        first_job_id = self.coordinator.prepare(_BIG_PAYLOAD, TrafficClass.GENERAL, _RECEIVER)
-        self._wait_until_resolved(first_job_id)
-
-        second_job_id = self.coordinator.prepare(_BIG_PAYLOAD, TrafficClass.GENERAL, _RECEIVER)
-        self.assertEqual(first_job_id, second_job_id)
-        self.assertEqual(self.telemetry.get("background_jobs_reused"), 1)
-
-
 class EvaluateCacheHitTest(CoordinatorTestCase):
-    def test_evaluate_consumes_ready_cache_from_prior_prepare(self) -> None:
+    def test_evaluate_reuses_ready_cached_result_from_prior_evaluate(self) -> None:
         self._add_ci_provider()
         self.fake.program_response(
             "ci", "/v1/messages", outcome="success",
-            body=_compressor_body("COMPACT", "from-prepare"),
+            body=_compressor_body("COMPACT", "from-first-evaluate"),
         )
 
-        job_id = self.coordinator.prepare(_BIG_PAYLOAD, TrafficClass.GENERAL, _RECEIVER)
-        self._wait_until_resolved(job_id)
+        first = self.coordinator.evaluate(_BIG_PAYLOAD, TrafficClass.GENERAL, _RECEIVER)
+        self.assertIs(first.outcome, Outcome.SUCCESS)
+        self.assertEqual(first.output, "from-first-evaluate")
 
         # Only one response was programmed; a second real AALP call here
         # would raise LookupError inside the fixture.
-        result = self.coordinator.evaluate(_BIG_PAYLOAD, TrafficClass.GENERAL, _RECEIVER)
-        self.assertIs(result.outcome, Outcome.SUCCESS)
-        self.assertEqual(result.output, "from-prepare")
+        second = self.coordinator.evaluate(_BIG_PAYLOAD, TrafficClass.GENERAL, _RECEIVER)
+        self.assertIs(second.outcome, Outcome.SUCCESS)
+        self.assertEqual(second.output, "from-first-evaluate")
         self.assertEqual(self.telemetry.get("synchronous_gate_cache_hits"), 1)
-
-
-class PressureModeTest(unittest.TestCase):
-    def setUp(self) -> None:
-        self.telemetry = Telemetry()
-        self.controller = PressureController(telemetry=self.telemetry)
-
-    def test_upward_crossings_transition_immediately(self) -> None:
-        self.assertEqual(self.controller.report(_RECEIVER, 0.50), PressureMode.BELOW_SOFT)
-        self.assertEqual(self.controller.report(_RECEIVER, 0.65), PressureMode.SOFT_TO_HARD)
-        self.assertEqual(self.controller.report(_RECEIVER, 0.80), PressureMode.HARD_TO_EMERGENCY)
-        self.assertEqual(self.controller.report(_RECEIVER, 0.90), PressureMode.ABOVE_EMERGENCY)
-        self.assertEqual(self.telemetry.get("pressure_mode_entries"), 3)
-        self.assertEqual(self.telemetry.get("pressure_mode_exits"), 3)
-
-    def test_small_downward_fluctuation_does_not_demote(self) -> None:
-        self.controller.report(_RECEIVER, 0.65)  # SOFT_TO_HARD, entry watermark 0.60
-        mode = self.controller.report(_RECEIVER, 0.58)  # 0.60 - 0.05 = 0.55 exit threshold
-        self.assertEqual(mode, PressureMode.SOFT_TO_HARD)
-        self.assertEqual(self.telemetry.get("pressure_mode_entries"), 1)
-
-    def test_large_downward_move_demotes(self) -> None:
-        self.controller.report(_RECEIVER, 0.65)  # SOFT_TO_HARD
-        mode = self.controller.report(_RECEIVER, 0.50)  # well below 0.55 exit threshold
-        self.assertEqual(mode, PressureMode.BELOW_SOFT)
-        self.assertEqual(self.telemetry.get("pressure_mode_entries"), 2)
-        self.assertEqual(self.telemetry.get("pressure_mode_exits"), 2)
-
-    def test_entries_and_exits_only_increment_on_actual_transition(self) -> None:
-        self.controller.report(_RECEIVER, 0.65)
-        before = self.telemetry.get("pressure_mode_entries")
-        self.controller.report(_RECEIVER, 0.66)  # still SOFT_TO_HARD: no transition
-        self.controller.report(_RECEIVER, 0.64)  # still SOFT_TO_HARD: no transition
-        self.assertEqual(self.telemetry.get("pressure_mode_entries"), before)
-
-    def test_pressure_isolated_per_receiver_key(self) -> None:
-        self.controller.report(_RECEIVER, 0.90)  # ABOVE_EMERGENCY
-        self.assertEqual(self.controller.mode_of(_RECEIVER), PressureMode.ABOVE_EMERGENCY)
-        self.assertEqual(self.controller.mode_of(_RECEIVER_B), PressureMode.BELOW_SOFT)
-
-    def test_should_run_maintenance_true_at_soft_to_hard_and_above(self) -> None:
-        self.assertFalse(self.controller.should_run_maintenance(_RECEIVER))
-        self.controller.report(_RECEIVER, 0.65)
-        self.assertTrue(self.controller.should_run_maintenance(_RECEIVER))
-
-
-class CoordinatorPressureIsolationTest(CoordinatorTestCase):
-    def test_report_pressure_isolated_across_receivers(self) -> None:
-        self.coordinator.report_pressure(_RECEIVER, 0.90)
-        status = self.coordinator.status()
-        self.assertIn("ABOVE_EMERGENCY", status["pressure"].values())
-        self.assertEqual(len(status["pressure"]), 1)
 
 
 class SweepStaleJobsTest(CoordinatorTestCase):
@@ -213,23 +119,33 @@ class SweepStaleJobsTest(CoordinatorTestCase):
         self.fake.program_response(
             "ci", "/v1/messages", outcome="success", body=_compressor_body("COMPACT", "old")
         )
-        old_job_id = self.coordinator.prepare(_BIG_PAYLOAD, TrafficClass.GENERAL, _RECEIVER)
-        self._wait_until_resolved(old_job_id)
+        old_result = self.coordinator.evaluate(_BIG_PAYLOAD, TrafficClass.GENERAL, _RECEIVER)
+        self.assertIs(old_result.outcome, Outcome.SUCCESS)
+        old_job_id = self.coordinator._store.cache[
+            self.coordinator._cache_key(
+                compute_hash(_BIG_PAYLOAD), TrafficClass.GENERAL
+            )
+        ]
         self.coordinator._store.jobs[old_job_id].completed_at = time.time() - 1_000
 
         self.fake.program_response(
-            "ci", "/v1/messages", outcome="success",
-            body=_compressor_body("COMPACT", "recent"), delay=1.0,
+            "ci", "/v1/messages", outcome="success", body=_compressor_body("COMPACT", "recent")
         )
-        recent_job_id = self.coordinator.prepare(
+        recent_result = self.coordinator.evaluate(
             _BIG_PAYLOAD_B, TrafficClass.GENERAL, _RECEIVER
         )
+        self.assertIs(recent_result.outcome, Outcome.SUCCESS)
+        recent_job_id = self.coordinator._store.cache[
+            self.coordinator._cache_key(
+                compute_hash(_BIG_PAYLOAD_B), TrafficClass.GENERAL
+            )
+        ]
 
         removed = self.coordinator.sweep_stale_jobs(max_age_seconds=10)
 
         self.assertIn(old_job_id, removed)
         self.assertNotIn(recent_job_id, removed)
-        self.assertIsNone(self.coordinator.resolve(old_job_id))
+        self.assertNotIn(old_job_id, self.coordinator._store.jobs)
 
 
 class StoreSourceTest(CoordinatorTestCase):

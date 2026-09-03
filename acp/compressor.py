@@ -28,7 +28,6 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass
-from enum import Enum
 from typing import Any
 
 from acp import gate
@@ -144,11 +143,6 @@ _UNCOUNTERED_FAILURE_BUCKET = "compression_availability"
 
 class CompressorProtocolViolation(ValueError):
     """The compressor's response did not follow ACP's response protocol."""
-
-
-class FailurePolicy(Enum):
-    PASSTHROUGH = "passthrough"
-    BLOCK = "block"
 
 
 @dataclass
@@ -360,21 +354,6 @@ def _parse_compressor_response(body: bytes) -> tuple[str, str, dict[str, Any] | 
     return mode, remainder, usage
 
 
-def _select_failure_policy(
-    estimated_tokens: int,
-    block_above_estimated_tokens: int | None,
-    override: FailurePolicy | None,
-) -> FailurePolicy:
-    if override is not None:
-        return override
-    if (
-        block_above_estimated_tokens is not None
-        and estimated_tokens > block_above_estimated_tokens
-    ):
-        return FailurePolicy.BLOCK
-    return FailurePolicy.PASSTHROUGH
-
-
 class Compressor:
     """Ties gate -> provenance -> AALP -> failure policy -> telemetry together.
 
@@ -396,12 +375,6 @@ class Compressor:
         compression_timeout: float = DEFAULT_COMPRESSION_TIMEOUT_SECONDS,
         total_timeout: float = DEFAULT_TOTAL_TIMEOUT_SECONDS,
         thresholds: dict[TrafficClass, TrafficClassThresholds] | None = None,
-        # Phase 6 benchmarking decision, not fixed here: `None` means
-        # "always PASSTHROUGH by default until benchmarked". Pass a
-        # token-count threshold to make large payloads BLOCK on
-        # failure instead, or override per-call via `compress(...,
-        # force_policy=...)`.
-        block_above_estimated_tokens: int | None = None,
     ) -> None:
         self._aalp_client = aalp_client
         self._telemetry = telemetry
@@ -412,7 +385,6 @@ class Compressor:
         self._compression_timeout = compression_timeout
         self._total_timeout = total_timeout
         self._thresholds = thresholds
-        self._block_above_estimated_tokens = block_above_estimated_tokens
         self._warnings = CompressionWarningTracker()
 
     @property
@@ -424,25 +396,9 @@ class Compressor:
         payload: str,
         traffic_class: TrafficClass,
         *,
-        prior_provenance: Provenance | None = None,
         flow_id: str | None = None,
-        force_policy: FailurePolicy | None = None,
     ) -> CompressionResult:
         source_hash = provenance_mod.compute_hash(payload)
-
-        # Anti-recursion guard: must short-circuit before any
-        # telemetry/gate/AALP work. No counters are touched here by
-        # design -- a repeated-crossing no-op should carry effectively
-        # zero overhead, not accrue phantom attempt/bypass counts.
-        if not provenance_mod.should_reprocess(prior_provenance, source_hash):
-            return CompressionResult(
-                outcome=Outcome.SUCCESS,
-                mode="PASS",
-                output=payload,
-                warnings=[],
-                message="anti-recursion short-circuit: already processed",
-                provenance=prior_provenance,
-            )
 
         decision = gate.evaluate(payload, traffic_class, thresholds=self._thresholds)
 
@@ -451,9 +407,7 @@ class Compressor:
             self._telemetry.increment(
                 "compression_bypass_tokens", decision.estimated_tokens
             )
-            new_provenance = provenance_mod.next_provenance(
-                prior_provenance, source_hash, processed=True
-            )
+            new_provenance = Provenance(processed=True, source_hash=source_hash)
             return CompressionResult(
                 outcome=Outcome.SUCCESS,
                 mode="PASS",
@@ -486,8 +440,7 @@ class Compressor:
         )
         # `AalpClient.forward` does not hand back a queue/execution
         # timing split, so only the whole round-trip is measured here,
-        # against `compression_execution_ms`; `compression_queue_wait_ms`
-        # is left untouched by this module.
+        # against `compression_execution_ms`.
         elapsed_seconds = time.monotonic() - started
 
         outcome = forward_result.outcome
@@ -508,12 +461,12 @@ class Compressor:
         if outcome is Outcome.SUCCESS:
             return self._handle_success(
                 payload, parsed_mode, parsed_output, usage, decision.estimated_tokens,
-                elapsed_seconds, prior_provenance, source_hash,
+                elapsed_seconds, source_hash,
             )
 
         return self._handle_failure(
             payload, outcome, failure_message, decision.estimated_tokens,
-            elapsed_seconds, prior_provenance, source_hash, force_policy,
+            elapsed_seconds, source_hash,
         )
 
     def _handle_success(
@@ -524,7 +477,6 @@ class Compressor:
         usage: dict[str, Any] | None,
         estimated_input_tokens: int,
         elapsed_seconds: float,
-        prior_provenance: Provenance | None,
         source_hash: str,
     ) -> CompressionResult:
         self._telemetry.increment("compression_successes")
@@ -558,9 +510,7 @@ class Compressor:
             "compression_saved_tokens", max(0, input_tokens - output_tokens)
         )
 
-        new_provenance = provenance_mod.next_provenance(
-            prior_provenance, source_hash, processed=True
-        )
+        new_provenance = Provenance(processed=True, source_hash=source_hash)
         warnings = self._warnings.record_success()
         return CompressionResult(
             outcome=Outcome.SUCCESS,
@@ -578,50 +528,20 @@ class Compressor:
         failure_message: str,
         estimated_tokens: int,
         elapsed_seconds: float,
-        prior_provenance: Provenance | None,
         source_hash: str,
-        force_policy: FailurePolicy | None,
     ) -> CompressionResult:
         counter_name = _TIMEOUT_COUNTER_BY_OUTCOME.get(outcome)
         self._telemetry.increment(counter_name or _UNCOUNTERED_FAILURE_BUCKET)
-
-        policy = _select_failure_policy(
-            estimated_tokens, self._block_above_estimated_tokens, force_policy
-        )
-        blocked = policy is FailurePolicy.BLOCK
 
         warnings = self._warnings.record_failure(
             outcome,
             elapsed_seconds=elapsed_seconds,
             estimated_tokens=estimated_tokens,
-            blocked=blocked,
         )
 
-        # A failed/timed-out attempt still received a verdict from this
-        # pipeline (passthrough or block); mark it processed so a
-        # caller that re-crosses the *same* boundary with the same
-        # provenance record doesn't loop. This does not disable retrying
-        # a genuinely re-submitted payload -- that's a fresh `compress()`
-        # call with no prior_provenance, which is always evaluated.
-        new_provenance = provenance_mod.next_provenance(
-            prior_provenance, source_hash, processed=True
-        )
-
-        if blocked:
-            self._telemetry.increment("compression_timeout_blocked_payloads")
-            placeholder = (
-                f"[ACP: content blocked -- compression failed ({outcome.value}) "
-                f"and this payload's failure policy is BLOCK; "
-                f"~{estimated_tokens} tokens withheld]"
-            )
-            return CompressionResult(
-                outcome=outcome,
-                mode=None,
-                output=placeholder,
-                warnings=warnings,
-                message=failure_message,
-                provenance=new_provenance,
-            )
+        # A failed/timed-out attempt still receives a verdict (always
+        # passthrough); mark it processed for audit purposes.
+        new_provenance = Provenance(processed=True, source_hash=source_hash)
 
         self._telemetry.increment("compression_timeout_bypass_tokens", estimated_tokens)
         return CompressionResult(

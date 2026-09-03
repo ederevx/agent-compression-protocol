@@ -53,24 +53,6 @@ class CapabilitiesTest(AalpClientTestCase):
             self.client.capabilities(force_refresh=True)
 
 
-class ProviderStatusTest(AalpClientTestCase):
-    def test_list_providers(self) -> None:
-        self._add_ci_provider()
-        self.fake.add_provider(FakeProvider(id="other", accepted_paths=["/v1/y"]))
-        providers = self.client.provider_status()
-        self.assertEqual({p["id"] for p in providers}, {"ci", "other"})
-
-    def test_single_provider(self) -> None:
-        self._add_ci_provider(concurrency_limit=3)
-        status = self.client.provider_status("ci")
-        self.assertEqual(status["id"], "ci")
-        self.assertEqual(status["concurrency_limit"], 3)
-        self.assertEqual(status["accepted_paths"], ["/v1/chat"])
-
-    def test_unknown_provider_returns_none(self) -> None:
-        self.assertIsNone(self.client.provider_status("nope"))
-
-
 class ForwardSuccessTest(AalpClientTestCase):
     def test_success_passes_through_body_and_headers(self) -> None:
         self._add_ci_provider()

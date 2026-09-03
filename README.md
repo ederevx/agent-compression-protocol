@@ -55,18 +55,12 @@ unless run with `--no-claude-code`).
   replace that after the fact either (agent_protocols_v1
   background-compression adjustment §29).
 
-`acp/adapters/hooks/` holds three more Phase 4 pieces, each a small
+`acp/adapters/hooks/` holds two more Phase 4 pieces, each a small
 host-neutral CLI script (`--agent claude|codex`) invoked as a hook
 subprocess, all failing open (silent no-op) on any ACP error:
 
 - `subagent_report.py`: on `SubagentStart`, injects context telling the
-  subagent about the `report` tool; on `SubagentStop`, fires a
-  best-effort background `context.prepare` cache-warm over the
-  subagent's transcript tail (never a guaranteed compression point --
-  see the module docstring).
-- `precompact_pressure.py`: on `PreCompact`, reports maximum pressure to
-  ACP's `context.pressure`, informing how eager its own proactive
-  preparation is -- never blocks or alters the host's actual compaction.
+  subagent about the `report` tool.
 - `parent_child_context.py`: on `PreToolUse` matched to the
   subagent-spawning tool (`Task` on Claude, `spawn_agent` on Codex),
   compresses only an explicit `<acp-context>...</acp-context>` block in
@@ -77,7 +71,7 @@ subprocess, all failing open (silent no-op) on any ACP error:
 `deploy/claude_code/install.py` and `deploy/codex/install.py` install
 these additively into each host's live config -- `mcpServers.acp-bash`/
 `permissions.deny` (Claude) or `codex mcp add` (Codex), plus the hook
-entries into `hooks.SubagentStart`/`SubagentStop`/`PreCompact` (and,
+entries into `hooks.SubagentStart`/`SubagentStop` (and,
 with `--with-parent-child-context`, `PreToolUse`). Every other existing
 key/entry (e.g. agent-mem-struct's hooks) is left untouched; re-running
 either script is a no-op once installed. Run with `--dry-run` to preview

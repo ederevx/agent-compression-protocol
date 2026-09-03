@@ -20,13 +20,6 @@ class TelemetryTest(unittest.TestCase):
         telemetry.increment("compression_input_tokens", amount=500)
         self.assertEqual(telemetry.get("compression_input_tokens"), 500)
 
-    def test_increment_accumulates(self) -> None:
-        telemetry = Telemetry()
-        telemetry.increment("background_jobs_enqueued")
-        telemetry.increment("background_jobs_enqueued")
-        telemetry.increment("background_jobs_enqueued", amount=3)
-        self.assertEqual(telemetry.get("background_jobs_enqueued"), 5)
-
     def test_unknown_counter_raises_on_increment(self) -> None:
         telemetry = Telemetry()
         with self.assertRaises(TelemetryError):
@@ -65,20 +58,8 @@ class TelemetryTest(unittest.TestCase):
             "compression_bypass_tokens", "compression_availability",
             "compression_queue_timeouts", "compression_execution_timeouts",
             "compression_total_timeouts", "compression_timeout_bypass_tokens",
-            "compression_timeout_blocked_payloads", "compression_queue_wait_ms",
-            "compression_execution_ms", "report_compression_attempts",
-            "report_compression_input_tokens", "report_compression_output_tokens",
-            "report_compression_saved_tokens", "report_compression_bypass_tokens",
-            "native_compression_fallbacks", "background_jobs_enqueued",
-            "background_jobs_started", "background_jobs_ready",
-            "background_jobs_reused", "background_jobs_stale",
-            "background_jobs_failed", "background_prefetch_hit_rate",
-            "background_prefetch_tokens_saved", "synchronous_gate_wait_ms",
+            "compression_execution_ms", "synchronous_gate_wait_ms",
             "synchronous_gate_cache_hits", "synchronous_gate_cache_misses",
-            "context_pressure_before", "context_pressure_after",
-            "pressure_mode_entries", "pressure_mode_exits",
-            "pressure_maintenance_jobs", "context_ingress_tokens_avoided",
-            "native_autocompactions_observed", "autocompaction_avoided_estimate",
         }
         self.assertEqual(set(COUNTER_NAMES), expected)
 

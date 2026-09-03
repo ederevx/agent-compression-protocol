@@ -11,8 +11,7 @@ usage; confirmed idempotent -- re-adding the same name just overwrites).
 `~/.codex/hooks.json` is touched additively, same discipline as the
 Claude installer: this repo's hook commands (identified by a stable
 marker substring in each `command`) are merged into `hooks.SubagentStart`,
-`hooks.SubagentStop`, and `hooks.PreCompact`, leaving every other event
-and every agent-mem-struct entry untouched.
+leaving every other event and every agent-mem-struct entry untouched.
 
 `hooks.PreToolUse` (matched to `spawn_agent`, for "parent -> child
 oversized support context") and shell-tool-exclusivity (disabling
@@ -52,7 +51,6 @@ def _hook_command(module: str) -> str:
 
 
 _SUBAGENT_REPORT_MODULE = "acp.adapters.hooks.subagent_report"
-_PRECOMPACT_PRESSURE_MODULE = "acp.adapters.hooks.precompact_pressure"
 _PARENT_CHILD_CONTEXT_MODULE = "acp.adapters.hooks.parent_child_context"
 
 
@@ -146,12 +144,6 @@ def install(
     hook_specs = [
         ("SubagentStart", _SUBAGENT_REPORT_MODULE, "SubagentStart", dict(
             status_message="ACP: offer the report tool for a large final report", timeout=5)),
-        ("SubagentStop", _SUBAGENT_REPORT_MODULE, "SubagentStop", dict(
-            status_message="ACP: best-effort background prewarm of a large transcript tail",
-            timeout=5)),
-        ("PreCompact", _PRECOMPACT_PRESSURE_MODULE, "PreCompact", dict(
-            status_message="ACP: report context pressure ahead of native compaction",
-            timeout=5)),
     ]
     if with_parent_child_context:
         hook_specs.append(("PreToolUse/spawn_agent", _PARENT_CHILD_CONTEXT_MODULE, "PreToolUse", dict(

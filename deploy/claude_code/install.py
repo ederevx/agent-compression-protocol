@@ -12,11 +12,10 @@ back unchanged and rewritten byte-for-byte equivalent (only reformatted):
   `permissions.deny`, so the MCP-provided `bash` tool (which routes
   output through ACP, failing open to raw output if ACP is unreachable)
   is the only way to run a shell command; and adds this repo's own hook
-  commands into `hooks.SubagentStart`, `hooks.SubagentStop`, and
-  `hooks.PreCompact` (each identified by a stable marker substring in
-  its `command`, so re-running this script is idempotent and existing
-  entries from other tools, e.g. agent-mem-struct, are never touched or
-  duplicated).
+  commands into `hooks.SubagentStart` (identified by a stable marker
+  substring in its `command`, so re-running this script is idempotent
+  and existing entries from other tools, e.g. agent-mem-struct, are
+  never touched or duplicated).
 
 `hooks.PreToolUse` (matched to the `Task` tool, for "parent -> child
 oversized support context") is deliberately NOT installed by this
@@ -68,7 +67,6 @@ def _hook_command(module: str, extra_args: str = "") -> str:
 
 
 _SUBAGENT_REPORT_MODULE = "acp.adapters.hooks.subagent_report"
-_PRECOMPACT_PRESSURE_MODULE = "acp.adapters.hooks.precompact_pressure"
 _PARENT_CHILD_CONTEXT_MODULE = "acp.adapters.hooks.parent_child_context"
 
 
@@ -161,12 +159,6 @@ def install(dry_run: bool, with_parent_child_context: bool) -> int:
     hook_specs = [
         ("SubagentStart", _SUBAGENT_REPORT_MODULE, "SubagentStart", dict(
             status_message="ACP: offer the report tool for a large final report", timeout=5)),
-        ("SubagentStop", _SUBAGENT_REPORT_MODULE, "SubagentStop", dict(
-            status_message="ACP: best-effort background prewarm of a large transcript tail",
-            timeout=5)),
-        ("PreCompact", _PRECOMPACT_PRESSURE_MODULE, "PreCompact", dict(
-            status_message="ACP: report context pressure ahead of native compaction",
-            timeout=5)),
     ]
     if with_parent_child_context:
         hook_specs.append(("PreToolUse/Task", _PARENT_CHILD_CONTEXT_MODULE, "PreToolUse", dict(

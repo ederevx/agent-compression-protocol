@@ -10,9 +10,9 @@ exactly as Claude/Codex would after ACP's `PostToolUse.updatedToolOutput`
 agent_protocols_v1_background_compression_adjustment_metadata_v1.md §26-
 29) replaces a tool result, and then invokes agent-mem-struct's real,
 installed `hooks/root-memory-context.py` as a subprocess -- exactly as
-Claude/Codex would fire it, since both ACP's PreCompact hook and agent-
-mem-struct's PreCompact hook additively coexist on the same event
-(§29 of agent_protocols_v1_metadata_v1.md). It never imports or
+Claude/Codex would fire it, since ACP's own ingress-transform path and
+agent-mem-struct's PreCompact hook operate on the same transcript
+content (§29 of agent_protocols_v1_metadata_v1.md). It never imports or
 monkeypatches agent-mem-struct internals, and never writes into that
 repository.
 
