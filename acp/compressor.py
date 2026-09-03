@@ -40,9 +40,15 @@ from acp.provenance import Provenance
 from acp.telemetry import Telemetry
 from acp.warnings import CompressionWarningTracker
 
-# Placeholder default -- the real model choice is a Phase 6 benchmarking
-# decision, not this wave's. Any caller can override it per-instance.
-DEFAULT_MODEL = "claude-haiku-4-5-20251001"
+# The `ci` provider's real, currently-only-available model as confirmed
+# by a live agent_protocols_v1 Phase 3 activation test against the real
+# CheapestInference-backed endpoint (a `claude-*` model id 404s there --
+# see cheapestinference_claude_agent_metadata_v2.md §4: this endpoint
+# proxies Claude-shaped requests to DeepSeek, not a real Claude model).
+# Still just a default: which model is best for compression quality is a
+# Phase 6 benchmarking decision, and any caller can override it per-
+# instance.
+DEFAULT_MODEL = "deepseek-v4-flash"
 
 # Ceiling on the compressed output's `max_tokens`, tunable later. The
 # actual cap used per call is min(this ceiling, the payload's own
