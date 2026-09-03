@@ -68,7 +68,6 @@ def _hook_command(module: str, extra_args: str = "") -> str:
 
 
 _SUBAGENT_REPORT_MODULE = "acp.adapters.hooks.subagent_report"
-_PRECOMPACT_PRESSURE_MODULE = "acp.adapters.hooks.precompact_pressure"
 _PARENT_CHILD_CONTEXT_MODULE = "acp.adapters.hooks.parent_child_context"
 
 
@@ -163,9 +162,6 @@ def install(dry_run: bool, with_parent_child_context: bool) -> int:
             status_message="ACP: offer the report tool for a large final report", timeout=5)),
         ("SubagentStop", _SUBAGENT_REPORT_MODULE, "SubagentStop", dict(
             status_message="ACP: best-effort background prewarm of a large transcript tail",
-            timeout=5)),
-        ("PreCompact", _PRECOMPACT_PRESSURE_MODULE, "PreCompact", dict(
-            status_message="ACP: report context pressure ahead of native compaction",
             timeout=5)),
     ]
     if with_parent_child_context:

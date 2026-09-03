@@ -2,18 +2,17 @@
 
 Per agent_protocols_v1_background_compression_adjustment_metadata_v1.md
 §17, no host adapter is permitted to run its own compression operation --
-every SYNCHRONOUS GATE / BACKGROUND PREFETCH / PRESSURE MAINTENANCE call
-(§11) goes through one `Coordinator` instance, which owns: job dedup, the
-prepared-result cache, synchronous/background/maintenance lifecycle,
-receiver-specific pressure state, AALP client calls (via `acp.compressor.
+every SYNCHRONOUS GATE / BACKGROUND PREFETCH call (§11) goes through one
+`Coordinator` instance, which owns: job dedup, the prepared-result cache,
+synchronous/background lifecycle, AALP client calls (via `acp.compressor.
 Compressor`, itself via `acp.aalp_client.AalpClient`), provenance, and
 telemetry.
 
 This is a pure Python API in this wave -- no HTTP yet (a later wave
 publishes it over loopback HTTP as ACP interface v1: `context.evaluate` /
-`context.prepare` / `context.resolve` / `context.pressure` / `source.
-store` / `service.status` map directly onto `evaluate` / `prepare` /
-`resolve` / `report_pressure` / `store_source` / `status` below).
+`context.prepare` / `context.resolve` / `source.store` / `service.status`
+map directly onto `evaluate` / `prepare` / `resolve` / `store_source` /
+`status` below).
 
 All three execution modes ultimately call the exact same `Compressor.
 compress()` -- the mode only controls *when* ACP submits and *whether the
@@ -55,8 +54,7 @@ from acp import provenance as provenance_mod
 from acp.aalp_client import AalpClient
 from acp.compressor import CompressionResult, Compressor
 from acp.errors import Outcome, TrafficClass
-from acp.jobs import Job, JobState, JobTransitionError, is_terminal, transition
-from acp.pressure import PressureController, PressureMode, PressureWatermarks, ReceiverKey
+from acp.jobs import Job, JobState, JobTransitionError, ReceiverKey, is_terminal, transition
 from acp.telemetry import Telemetry
 
 # ACP-side budget for how long a synchronous `evaluate()` caller will wait
@@ -67,11 +65,16 @@ from acp.telemetry import Telemetry
 DEFAULT_SYNCHRONOUS_TIMEOUT_SECONDS = 60.0
 
 # A job's `urgency_class` for a job created purely to perform (or
-# coalesce) a SYNCHRONOUS GATE, as distinct from "prefetch"/"maintenance"
-# background jobs. Background-only telemetry counters
-# (background_jobs_enqueued/started/ready/failed) are never incremented
-# for a job carrying this urgency_class.
+# coalesce) a SYNCHRONOUS GATE, as distinct from a "prefetch" background
+# job. Background-only telemetry counters (background_jobs_enqueued/
+# started/ready/failed) are never incremented for a job carrying this
+# urgency_class.
 _SYNCHRONOUS_URGENCY = "synchronous"
+
+# The only urgency_class a background `prepare()` job is ever created
+# with -- not a public choice (see `prepare()` below, which takes no
+# urgency parameter): every background job is a prefetch.
+_PREFETCH_URGENCY = "prefetch"
 
 # Outcome -> JobState mapping for a job that finished RUNNING.
 # `acp.jobs.VALID_TRANSITIONS[RUNNING]` only permits {READY, FAILED,
@@ -116,8 +119,8 @@ class _JobStore:
     compound read/modify sequence across these dicts still happens under
     `Coordinator._lock`, exactly as before. Nothing outside this module
     constructs or touches a `_JobStore` -- ACP interface v1 (`context.
-    evaluate` / `context.prepare` / `context.resolve` / `context.pressure`
-    / `source.store` / `service.status`, per this module's docstring) and
+    evaluate` / `context.prepare` / `context.resolve` / `source.store` /
+    `service.status`, per this module's docstring) and
     every Claude/Codex host adapter only ever call `Coordinator`'s public
     methods, so this is an internal-only regrouping with no client-visible
     effect (§39 of agent_protocols_v1_background_compression_adjustment_
@@ -144,7 +147,6 @@ class Coordinator:
         telemetry: Telemetry | None = None,
         compressor_kwargs: dict | None = None,
         policy_version: str = "v1",
-        pressure_watermarks: PressureWatermarks | None = None,
         synchronous_timeout: float = DEFAULT_SYNCHRONOUS_TIMEOUT_SECONDS,
     ) -> None:
         self._root = root
@@ -163,10 +165,6 @@ class Coordinator:
         self._model = compressor_kwargs.get("model", compressor_mod.DEFAULT_MODEL)
         self._compressor = Compressor(self._aalp_client, self._telemetry, **compressor_kwargs)
 
-        self._pressure = PressureController(
-            telemetry=self._telemetry, watermarks=pressure_watermarks
-        )
-
         # Single coarse lock guarding every dict below. Workload for this
         # wave (in-memory job store, no persistence) does not warrant
         # finer-grained per-key locking; correctness of the coalescing
@@ -178,10 +176,6 @@ class Coordinator:
     @property
     def telemetry(self) -> Telemetry:
         return self._telemetry
-
-    @property
-    def pressure(self) -> PressureController:
-        return self._pressure
 
     # -- cache key -----------------------------------------------------
 
@@ -262,7 +256,7 @@ class Coordinator:
         """Telemetry for consuming an existing job's result instead of compressing.
 
         `background_jobs_reused` fires only when the reused job is itself
-        a background (prefetch/maintenance) job -- not when two
+        a background (prefetch) job -- not when two
         synchronous `evaluate()` callers coalesce onto each other's ad hoc
         job, since that is synchronous coalescing, not reuse of prior
         background *preparation*. `synchronous_gate_cache_hits` fires
@@ -373,7 +367,7 @@ class Coordinator:
         self._finalize_job(own_job_id, result)
         return result
 
-    # -- BACKGROUND PREFETCH / PRESSURE MAINTENANCE ------------------------
+    # -- BACKGROUND PREFETCH -------------------------------------------------
 
     def prepare(
         self,
@@ -381,7 +375,6 @@ class Coordinator:
         traffic_class: TrafficClass,
         receiver_key: ReceiverKey,
         *,
-        urgency: str = "prefetch",
         flow_id: str | None = None,
         prior_provenance=None,
     ) -> str:
@@ -403,7 +396,7 @@ class Coordinator:
 
             job_id, _job = self._register_job(
                 source_hash, traffic_class, receiver_key, flow_id, payload,
-                urgency_class=urgency, state=JobState.QUEUED,
+                urgency_class=_PREFETCH_URGENCY, state=JobState.QUEUED,
             )
             self._store.cache[key] = job_id
             self._store.cache_keys[job_id] = key
@@ -482,36 +475,6 @@ class Coordinator:
         self._telemetry.increment("background_jobs_stale")
         return job
 
-    # -- pressure ---------------------------------------------------------
-
-    def report_pressure(self, receiver_key: ReceiverKey, observed_ratio: float) -> PressureMode:
-        return self._pressure.report(receiver_key, observed_ratio)
-
-    def maybe_trigger_maintenance(
-        self,
-        payload: str,
-        traffic_class: TrafficClass,
-        receiver_key: ReceiverKey,
-        *,
-        flow_id: str | None = None,
-        prior_provenance=None,
-    ) -> str | None:
-        """Demonstration hook: `prepare()` under pressure, if warranted.
-
-        A full proactive scanner that discovers deferred/raw material to
-        prepare is out of scope for this wave (§23 only asks for the
-        threshold machinery and a hook point); this method is that hook,
-        callable once a caller already has a specific payload in mind.
-        """
-        if not self._pressure.should_run_maintenance(receiver_key):
-            return None
-        job_id = self.prepare(
-            payload, traffic_class, receiver_key, urgency="maintenance",
-            flow_id=flow_id, prior_provenance=prior_provenance,
-        )
-        self._telemetry.increment("pressure_maintenance_jobs")
-        return job_id
-
     # -- source store -------------------------------------------------------
 
     def store_source(self, content: bytes) -> str:
@@ -549,7 +512,6 @@ class Coordinator:
             jobs_by_state: dict[str, int] = {}
             for job in self._store.jobs.values():
                 jobs_by_state[job.state.value] = jobs_by_state.get(job.state.value, 0) + 1
-            pressure_snapshot = self._pressure.snapshot()
 
         try:
             self._aalp_client.capabilities()
@@ -561,5 +523,4 @@ class Coordinator:
             "policy_version": self._policy_version,
             "jobs_by_state": jobs_by_state,
             "aalp_reachable": aalp_reachable,
-            "pressure": pressure_snapshot,
         }

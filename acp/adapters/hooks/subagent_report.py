@@ -144,7 +144,7 @@ def handle_stop(agent: str, event: dict[str, Any], acp_root: str) -> int:
         return 0
     try:
         AcpClient(acp_root).prepare(
-            tail, "native_agent_report", receiver_of(agent, event), urgency="prefetch",
+            tail, "native_agent_report", receiver_of(agent, event),
         )
     except Exception:
         pass

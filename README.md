@@ -55,7 +55,7 @@ unless run with `--no-claude-code`).
   replace that after the fact either (agent_protocols_v1
   background-compression adjustment §29).
 
-`acp/adapters/hooks/` holds three more Phase 4 pieces, each a small
+`acp/adapters/hooks/` holds two more Phase 4 pieces, each a small
 host-neutral CLI script (`--agent claude|codex`) invoked as a hook
 subprocess, all failing open (silent no-op) on any ACP error:
 
@@ -64,9 +64,6 @@ subprocess, all failing open (silent no-op) on any ACP error:
   best-effort background `context.prepare` cache-warm over the
   subagent's transcript tail (never a guaranteed compression point --
   see the module docstring).
-- `precompact_pressure.py`: on `PreCompact`, reports maximum pressure to
-  ACP's `context.pressure`, informing how eager its own proactive
-  preparation is -- never blocks or alters the host's actual compaction.
 - `parent_child_context.py`: on `PreToolUse` matched to the
   subagent-spawning tool (`Task` on Claude, `spawn_agent` on Codex),
   compresses only an explicit `<acp-context>...</acp-context>` block in

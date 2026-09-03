@@ -12,8 +12,8 @@ the same contract.
 `acp.coordinator.Coordinator` is the single owner of ACP's
 background/synchronous compression state (agent_protocols_v1_background_
 compression_adjustment_metadata_v1.md §17): job dedup, the prepared-result
-cache, synchronous/background/maintenance lifecycle, receiver-specific
-pressure state, AALP client calls, provenance, and telemetry. A host
+cache, synchronous/background lifecycle, AALP client calls, provenance,
+and telemetry. A host
 adapter that imported `acp.coordinator` directly, instantiated
 `Coordinator` itself, or read `.acp/` private state on disk would be
 coupled to implementation details that were never meant to be a contract
@@ -85,13 +85,12 @@ Status code follows `outcomes.values.<outcome>.response_status_code` in
 naming the outcome explicitly, mirroring AALP's own `X-Aalp-Outcome`
 requirement — see `x_acp_outcome_header` below for why.
 
-### `context.prepare` — BACKGROUND PREFETCH / PRESSURE MAINTENANCE
+### `context.prepare` — BACKGROUND PREFETCH
 
 `POST /v1/context/prepare` — enqueue/deduplicate background preparation
-without blocking the caller. Adds `urgency`
-(`prefetch`/`maintenance`, default `prefetch`) to the same
-payload/traffic_class/receiver/flow_id/prior_provenance fields; no
-`synchronous_timeout` or `force_policy` — both are `context.evaluate`-only.
+without blocking the caller. Same payload/traffic_class/receiver/flow_id/
+prior_provenance fields as `context.evaluate`; no `synchronous_timeout`
+or `force_policy` — both are `context.evaluate`-only.
 Response: `{"job_id": "..."}`, `202 Accepted`. `prepare()` never installs a
 result anywhere by itself (§12) — a caller must explicitly `context.resolve`
 at its own safe boundary.
@@ -104,14 +103,6 @@ reclaimed by the coordinator's stale-job sweep) returns
 `{"status": "pending"}`, `200` — **this is not an error case**. A terminal
 job returns the same `compression_result_envelope`/`X-Acp-Outcome` shape
 `context.evaluate` uses, status-coded the same way.
-
-### `context.pressure`
-
-`POST /v1/context/pressure` — report one receiver's observed
-context-pressure ratio (§22-23) and get back its current `PressureMode`.
-Request: `{"receiver": {...}, "observed_ratio": <0.0-1.0>}`. Response:
-`{"mode": "below_soft"|"soft_to_hard"|"hard_to_emergency"|"above_emergency"}`,
-`200`. An out-of-range ratio (outside `[0.0, 1.0]`) returns `400`.
 
 ### `source.store`
 
@@ -127,18 +118,18 @@ provenance/audit registration, not as a retrieval store.
 
 `GET /v1/service/capabilities` → `{"service": "acp", "interface_version": 1, "capabilities": [...]}`
 
-The discovery entry point. v1 declares exactly the seven capability strings
+The discovery entry point. v1 declares exactly the six capability strings
 above, one per operation (`context.evaluate`, `context.prepare`,
-`context.resolve`, `context.pressure`, `source.store`, `service.status`,
+`context.resolve`, `source.store`, `service.status`,
 `service.telemetry`).
 
 ### `service.status`
 
 `GET /v1/service/status` → `acp.coordinator.Coordinator.status()`'s own
 return value directly: `policy_version`, `jobs_by_state` (a per-`JobState`
-count, never per-job detail), `aalp_reachable`, and a per-receiver
-`pressure` mode-name snapshot. Guaranteed, by `Coordinator.status()`'s own
-docstring, to never carry a raw payload or credential.
+count, never per-job detail), and `aalp_reachable`. Guaranteed, by
+`Coordinator.status()`'s own docstring, to never carry a raw payload or
+credential.
 
 ### `service.telemetry`
 
@@ -182,10 +173,10 @@ Both are still reported with the real, non-`success` `outcome` value and
 the matching non-200 status code — a client must never infer success from
 the presence of a usable `output` field alone.
 
-`context.prepare`, `context.pressure`, `source.store`,
-`service.capabilities`, and `service.status` are not modeled with this
-enum; they use ordinary status-code semantics (see `contract.json` for
-each one's exact status codes).
+`context.prepare`, `source.store`, `service.capabilities`, and
+`service.status` are not modeled with this enum; they use ordinary
+status-code semantics (see `contract.json` for each one's exact status
+codes).
 
 ## `X-Acp-Outcome`
 

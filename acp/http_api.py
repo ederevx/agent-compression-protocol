@@ -7,19 +7,18 @@ AALP -- where `Gateway.as_ingress_handler()` lives on the composition-root
 class itself, because `Gateway.handle()` already needed an HTTP-shaped
 `(method, path, headers, body)` signature for its own passthrough
 forwarding job -- `Coordinator`'s public API
-(`evaluate`/`prepare`/`resolve`/`report_pressure`/`store_source`/
-`status`) is a plain Python API with no HTTP shape of its own, and is
+(`evaluate`/`prepare`/`resolve`/`store_source`/`status`) is a plain
+Python API with no HTTP shape of its own, and is
 worth keeping directly callable by an in-process host adapter with zero
 HTTP machinery involved. Putting the six-operation dispatch in this
 separate module keeps that split clean: `Coordinator` never imports
 `json` or knows an HTTP status code exists.
 
-Seven operations, all under `/v1/...`, mirroring `interface/v1/contract.json`:
+Six operations, all under `/v1/...`, mirroring `interface/v1/contract.json`:
 
     POST /v1/context/evaluate
     POST /v1/context/prepare
     GET  /v1/context/resolve/{job_id}
-    POST /v1/context/pressure
     POST /v1/source/store           (raw binary body, not JSON)
     GET  /v1/service/capabilities
     GET  /v1/service/status
@@ -43,7 +42,6 @@ INTERFACE_V1_CAPABILITIES: tuple[str, ...] = (
     "context.evaluate",
     "context.prepare",
     "context.resolve",
-    "context.pressure",
     "source.store",
     "service.status",
     "service.telemetry",
@@ -221,13 +219,10 @@ def build_handler(coordinator: Coordinator) -> Handler:
         traffic_class = _parse_traffic_class(payload.get("traffic_class"))
         receiver_key = _parse_receiver(payload.get("receiver"))
         flow_id = _parse_optional_str(payload.get("flow_id"), "flow_id")
-        urgency = payload.get("urgency", "prefetch")
-        if urgency not in ("prefetch", "maintenance"):
-            raise _BadRequest(f"invalid urgency: {urgency!r}")
         prior_provenance = _parse_provenance(payload.get("prior_provenance"))
         job_id = coordinator.prepare(
             text, traffic_class, receiver_key,
-            urgency=urgency, flow_id=flow_id, prior_provenance=prior_provenance,
+            flow_id=flow_id, prior_provenance=prior_provenance,
         )
         return _json_response(202, {"job_id": job_id})
 
@@ -236,18 +231,6 @@ def build_handler(coordinator: Coordinator) -> Handler:
         if result is None:
             return _json_response(200, {"status": "pending"})
         return _result_response(result)
-
-    def _handle_pressure(body: bytes) -> tuple[int, dict[str, str], bytes]:
-        payload = _parse_json_body(body)
-        receiver_key = _parse_receiver(payload.get("receiver"))
-        observed_ratio = payload.get("observed_ratio")
-        if not isinstance(observed_ratio, (int, float)):
-            raise _BadRequest("observed_ratio must be a number")
-        try:
-            mode = coordinator.report_pressure(receiver_key, float(observed_ratio))
-        except ValueError as exc:
-            return _error_response(400, str(exc))
-        return _json_response(200, {"mode": mode.name.lower()})
 
     def _handle_store(body: bytes) -> tuple[int, dict[str, str], bytes]:
         source_hash = coordinator.store_source(body)
@@ -283,8 +266,6 @@ def build_handler(coordinator: Coordinator) -> Handler:
                 and segments[:3] == ["v1", "context", "resolve"]
             ):
                 return _handle_resolve(segments[3])
-            if method == "POST" and segments == ["v1", "context", "pressure"]:
-                return _handle_pressure(body)
             if method == "POST" and segments == ["v1", "source", "store"]:
                 return _handle_store(body)
             if method == "GET" and segments == ["v1", "service", "capabilities"]:

@@ -9,8 +9,6 @@ from acp import containment
 from acp.coordinator import Coordinator
 from acp.errors import Outcome, TrafficClass
 from acp.provenance import compute_hash
-from acp.pressure import PressureController, PressureMode
-from acp.telemetry import Telemetry
 from tests.fixtures.fake_aalp_v1 import FakeAalpV1, FakeProvider
 
 # > 32000 chars -> > 8000 estimated tokens (len // 4) -> GENERAL traffic
@@ -18,7 +16,6 @@ from tests.fixtures.fake_aalp_v1 import FakeAalpV1, FakeProvider
 _BIG_PAYLOAD = "log line filler content " * 1600
 _BIG_PAYLOAD_B = "a different big payload body " * 1500
 _RECEIVER = ("test-host", "session-1", None)
-_RECEIVER_B = ("test-host", "session-2", None)
 
 
 def _compressor_body(mode: str, text: str = "", usage: dict | None = None) -> bytes:
@@ -153,58 +150,6 @@ class EvaluateCacheHitTest(CoordinatorTestCase):
         self.assertIs(result.outcome, Outcome.SUCCESS)
         self.assertEqual(result.output, "from-prepare")
         self.assertEqual(self.telemetry.get("synchronous_gate_cache_hits"), 1)
-
-
-class PressureModeTest(unittest.TestCase):
-    def setUp(self) -> None:
-        self.telemetry = Telemetry()
-        self.controller = PressureController(telemetry=self.telemetry)
-
-    def test_upward_crossings_transition_immediately(self) -> None:
-        self.assertEqual(self.controller.report(_RECEIVER, 0.50), PressureMode.BELOW_SOFT)
-        self.assertEqual(self.controller.report(_RECEIVER, 0.65), PressureMode.SOFT_TO_HARD)
-        self.assertEqual(self.controller.report(_RECEIVER, 0.80), PressureMode.HARD_TO_EMERGENCY)
-        self.assertEqual(self.controller.report(_RECEIVER, 0.90), PressureMode.ABOVE_EMERGENCY)
-        self.assertEqual(self.telemetry.get("pressure_mode_entries"), 3)
-        self.assertEqual(self.telemetry.get("pressure_mode_exits"), 3)
-
-    def test_small_downward_fluctuation_does_not_demote(self) -> None:
-        self.controller.report(_RECEIVER, 0.65)  # SOFT_TO_HARD, entry watermark 0.60
-        mode = self.controller.report(_RECEIVER, 0.58)  # 0.60 - 0.05 = 0.55 exit threshold
-        self.assertEqual(mode, PressureMode.SOFT_TO_HARD)
-        self.assertEqual(self.telemetry.get("pressure_mode_entries"), 1)
-
-    def test_large_downward_move_demotes(self) -> None:
-        self.controller.report(_RECEIVER, 0.65)  # SOFT_TO_HARD
-        mode = self.controller.report(_RECEIVER, 0.50)  # well below 0.55 exit threshold
-        self.assertEqual(mode, PressureMode.BELOW_SOFT)
-        self.assertEqual(self.telemetry.get("pressure_mode_entries"), 2)
-        self.assertEqual(self.telemetry.get("pressure_mode_exits"), 2)
-
-    def test_entries_and_exits_only_increment_on_actual_transition(self) -> None:
-        self.controller.report(_RECEIVER, 0.65)
-        before = self.telemetry.get("pressure_mode_entries")
-        self.controller.report(_RECEIVER, 0.66)  # still SOFT_TO_HARD: no transition
-        self.controller.report(_RECEIVER, 0.64)  # still SOFT_TO_HARD: no transition
-        self.assertEqual(self.telemetry.get("pressure_mode_entries"), before)
-
-    def test_pressure_isolated_per_receiver_key(self) -> None:
-        self.controller.report(_RECEIVER, 0.90)  # ABOVE_EMERGENCY
-        self.assertEqual(self.controller.mode_of(_RECEIVER), PressureMode.ABOVE_EMERGENCY)
-        self.assertEqual(self.controller.mode_of(_RECEIVER_B), PressureMode.BELOW_SOFT)
-
-    def test_should_run_maintenance_true_at_soft_to_hard_and_above(self) -> None:
-        self.assertFalse(self.controller.should_run_maintenance(_RECEIVER))
-        self.controller.report(_RECEIVER, 0.65)
-        self.assertTrue(self.controller.should_run_maintenance(_RECEIVER))
-
-
-class CoordinatorPressureIsolationTest(CoordinatorTestCase):
-    def test_report_pressure_isolated_across_receivers(self) -> None:
-        self.coordinator.report_pressure(_RECEIVER, 0.90)
-        status = self.coordinator.status()
-        self.assertIn("ABOVE_EMERGENCY", status["pressure"].values())
-        self.assertEqual(len(status["pressure"]), 1)
 
 
 class SweepStaleJobsTest(CoordinatorTestCase):

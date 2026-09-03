@@ -110,14 +110,6 @@ class AcpClientEndToEndTest(unittest.TestCase):
     def test_resolve_unknown_job_id_returns_none(self) -> None:
         self.assertIsNone(self.client.resolve("no-such-job"))
 
-    def test_report_pressure_returns_mode_name(self) -> None:
-        mode = self.client.report_pressure(self._receiver(), 0.9)
-        self.assertEqual(mode, "above_emergency")
-
-    def test_report_pressure_rejects_out_of_range_ratio(self) -> None:
-        with self.assertRaises(AcpProtocolError):
-            self.client.report_pressure(self._receiver(), 5.0)
-
     def test_store_source_returns_content_addressed_hash(self) -> None:
         first = self.client.store_source(b"identical content")
         second = self.client.store_source(b"identical content")

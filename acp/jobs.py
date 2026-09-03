@@ -13,8 +13,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from typing import Optional
 
 from acp.errors import TrafficClass
+
+# (host, session_id, agent_id-or-None) identifying who a job's compressed
+# result is for -- mirrors Job's own receiver_host/receiver_session_id/
+# receiver_agent_id fields below, which is why it lives here rather than
+# in any one particular consumer of it.
+ReceiverKey = tuple[str, str, Optional[str]]
 
 
 class JobState(Enum):

@@ -324,24 +324,6 @@ class PrepareResolveTest(AcpServeEndToEndTest):
         self.assertEqual(final["output"], "prepared-output")
 
 
-class PressureTest(AcpServeEndToEndTest):
-    def test_valid_ratio_returns_mode(self) -> None:
-        response, body = self._post_json(
-            "/v1/context/pressure",
-            {"receiver": {"host": "h", "session_id": "s", "agent_id": None}, "observed_ratio": 0.65},
-        )
-        self.assertEqual(response.status, 200)
-        self.assertEqual(body["mode"], "soft_to_hard")
-
-    def test_out_of_range_ratio_returns_400(self) -> None:
-        response, body = self._post_json(
-            "/v1/context/pressure",
-            {"receiver": {"host": "h", "session_id": "s", "agent_id": None}, "observed_ratio": 1.5},
-        )
-        self.assertEqual(response.status, 400)
-        self.assertEqual(body["error"], "bad_request")
-
-
 class SourceStoreTest(AcpServeEndToEndTest):
     def test_raw_body_round_trips_to_matching_source_hash(self) -> None:
         content = b"raw source bytes for http round-trip"
@@ -387,16 +369,6 @@ class AuthenticationTest(AcpServeEndToEndTest):
 
         resolve_response, _ = self._get("/v1/context/resolve/nonexistent", authorized=False)
         self.assertEqual(resolve_response.status, 401)
-
-        pressure_response, _ = self._post(
-            "/v1/context/pressure",
-            json.dumps({
-                "receiver": {"host": "h", "session_id": "s", "agent_id": None},
-                "observed_ratio": 0.5,
-            }).encode("utf-8"),
-            authorized=False,
-        )
-        self.assertEqual(pressure_response.status, 401)
 
         store_response, _ = self._post(
             "/v1/source/store", b"data", authorized=False,

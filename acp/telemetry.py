@@ -44,19 +44,9 @@ COUNTER_NAMES: tuple[str, ...] = (
     "background_jobs_reused",
     "background_jobs_stale",
     "background_jobs_failed",
-    "background_prefetch_hit_rate",
-    "background_prefetch_tokens_saved",
     "synchronous_gate_wait_ms",
     "synchronous_gate_cache_hits",
     "synchronous_gate_cache_misses",
-    "context_pressure_before",
-    "context_pressure_after",
-    "pressure_mode_entries",
-    "pressure_mode_exits",
-    "pressure_maintenance_jobs",
-    "context_ingress_tokens_avoided",
-    "native_autocompactions_observed",
-    "autocompaction_avoided_estimate",
 )
 
 
