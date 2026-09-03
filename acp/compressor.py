@@ -57,7 +57,25 @@ DEFAULT_MODEL = "deepseek-v4-flash"
 # allowed to ask for much more than half its input's tokens back out,
 # floored so tiny payloads still get a workable budget. See
 # `_compute_max_tokens` and `_compute_target_tokens`.
-DEFAULT_MAX_TOKENS_CEILING = 4096
+#
+# Derived from `gate.py`'s own thresholds -- the lowest `bypass_max`
+# across all traffic classes -- rather than an independent hardcoded
+# number, so this ceiling can never silently drift out of sync with the
+# smallest payload size that ever actually reaches INSPECT. Concretely
+# this is `NATIVE_AGENT_REPORT_THRESHOLDS.bypass_max` (4,000): for that
+# traffic class, the 50%-of-input figure (target + tolerance) is already
+# the binding constraint at and above its own threshold (e.g. ~2,200 for
+# a payload just past 4,000 estimated tokens, well under this ceiling),
+# so the 50% cap governs rather than an arbitrary constant for the
+# smallest inputs any traffic class ever compresses. For GENERAL/
+# DOWNWARD_CONTEXT payloads whose own thresholds sit above this ceiling,
+# this absolute number remains the binding constraint instead of the
+# 50% figure -- letting the ceiling scale with those classes' own
+# (higher) thresholds too would require raising it, not lowering it;
+# this value is deliberately the smallest-common-denominator choice.
+DEFAULT_MAX_TOKENS_CEILING = min(
+    thresholds.bypass_max for thresholds in gate.DEFAULT_THRESHOLDS.values()
+)
 _MIN_MAX_TOKENS = 256
 
 # `_compute_max_tokens`'s hard, API-enforced cap extends

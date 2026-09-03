@@ -6,7 +6,9 @@ from pathlib import Path
 import json as _json
 
 from acp.aalp_client import AalpClient
+from acp import gate
 from acp.compressor import (
+    DEFAULT_MAX_TOKENS_CEILING,
     Compressor,
     FailurePolicy,
     _build_request_body,
@@ -280,6 +282,29 @@ class CompressAsMuchAsPossiblePromptTest(unittest.TestCase):
         content = body["messages"][0]["content"]
         self.assertIn("NOT a target to reach", content)
         self.assertIn("smallest output", content)
+
+
+class DefaultCeilingDerivationTest(unittest.TestCase):
+    """`DEFAULT_MAX_TOKENS_CEILING` must track `gate.py`'s own lowest
+    `bypass_max` (the smallest payload any traffic class ever sends to
+    INSPECT) rather than an independent hardcoded number that could
+    silently drift out of sync with it."""
+
+    def test_ceiling_equals_lowest_bypass_max_across_traffic_classes(self) -> None:
+        lowest_bypass_max = min(
+            thresholds.bypass_max for thresholds in gate.DEFAULT_THRESHOLDS.values()
+        )
+        self.assertEqual(DEFAULT_MAX_TOKENS_CEILING, lowest_bypass_max)
+
+    def test_fraction_cap_binds_at_the_lowest_threshold_class(self) -> None:
+        # Just past NATIVE_AGENT_REPORT's own bypass_max (the lowest
+        # threshold): the 50%-plus-tolerance figure must be the binding
+        # constraint, not this ceiling.
+        estimated_input_tokens = gate.NATIVE_AGENT_REPORT_THRESHOLDS.bypass_max + 1
+        max_tokens = _compute_max_tokens(estimated_input_tokens, DEFAULT_MAX_TOKENS_CEILING)
+        fraction_cap = estimated_input_tokens // 2 + round(estimated_input_tokens * 0.05)
+        self.assertEqual(max_tokens, fraction_cap)
+        self.assertLess(max_tokens, DEFAULT_MAX_TOKENS_CEILING)
 
 
 class TargetTokensTest(unittest.TestCase):
