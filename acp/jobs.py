@@ -47,11 +47,19 @@ _TERMINAL_STATES = frozenset({
 })
 
 VALID_TRANSITIONS: dict[JobState, frozenset[JobState]] = {
+    # QUEUED -> STALE (Wave D1 addition): a background job's consumer may
+    # stop needing it before AALP submission (agent_protocols_v1
+    # background-compression adjustment, §31, "before AALP submission").
+    # There is deliberately no RUNNING -> STALE edge: once a job has been
+    # submitted to AALP, §31 requires preserving AALP confirmed-close/
+    # quarantine safety rather than abandoning an in-flight request, so a
+    # RUNNING job is left to reach its own terminal state.
     JobState.QUEUED: frozenset({
         JobState.RUNNING,
         JobState.QUEUE_TIMEOUT,
         JobState.BYPASSED,
         JobState.BLOCKED,
+        JobState.STALE,
     }),
     JobState.RUNNING: frozenset({
         JobState.READY,
