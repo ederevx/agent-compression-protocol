@@ -19,21 +19,21 @@ adapter that imported `acp.coordinator` directly, instantiated
 coupled to implementation details that were never meant to be a contract
 — and, per §17, would risk running its own compression operation outside
 the coordinator's dedup/lifecycle ownership entirely. Interface v1 exists
-so a host adapter (and this repository's own HTTP-level tests) can be
+so a host adapter (and this repository's own socket-level tests) can be
 built and tested against *this document alone*.
 
 ## Bootstrap: discovering ACP and authenticating
 
-Every operation below requires a live loopback HTTP connection to ACP and
-a bearer secret. A client discovers both the same way AALP's own clients
-discover AALP (agent-api-lane-protocol/interface/v1/README.md's own
+Every operation below requires a live loopback Unix-domain-socket
+connection to ACP and a bearer secret. A client discovers both the same
+way AALP's own clients discover AALP (agent-api-lane-protocol/interface/v1/README.md's own
 Bootstrap section) — this is the one deliberate, narrow exception to
 "never read another protocol's — or ACP's own — private state outside its
 published interface."
 
 - **`<ACP root>/.acp/state/ingress.json`** — written atomically by ACP's
   ingress on startup, before it accepts any connection. Contains
-  `{"host": "127.0.0.1", "port": <int>, "secret_file": "<absolute path>"}`.
+  `{"socket_path": "<absolute path>", "secret_file": "<absolute path>"}`.
   `<ACP root>` resolves to the `ACP_HOME` environment variable if set,
   else the working directory ACP was started from
   (`acp.containment.resolve_root`); a client must be told this root
@@ -41,12 +41,25 @@ published interface."
   operation for locating an unknown root.
 - **`<secret_file>`** (default `<ACP root>/.acp/state/ingress.secret`) —
   an opaque bearer token, `0600`, owner-only, generated once. A client
-  reads its raw contents and sends them back as
-  `Authorization: Bearer <contents>` on every request below.
+  reads its raw contents and sends them back as the request envelope's
+  `Authorization: Bearer <contents>` header field on every request below.
 
 A client reads exactly these two paths and nothing else under `.acp/`.
 Raw stored source, job/cache internals, and logs remain off-limits in
 every version of this interface.
+
+### Wire protocol
+
+Interface v1 speaks the same minimal length-prefixed JSON protocol over
+`AF_UNIX` as AALP's own interface v1 (see
+agent-api-lane-protocol/interface/v1/README.md's Wire protocol section):
+one request and one response per connection, each a 4-byte big-endian
+length prefix followed by that many bytes of UTF-8 JSON. `method`/`path`
+below describe each operation's binding exactly the way an HTTP verb and
+path would — they are envelope fields now, not a literal HTTP request
+line. ACP's ingress imposes no read/write deadline of its own; a caller
+enforces its own budgets as one cumulative deadline across however many
+individual socket reads/writes a call takes.
 
 ## The six operations
 
@@ -155,14 +168,14 @@ the presence of a usable `output` field alone.
 
 `context.prepare`, `context.pressure`, `source.store`,
 `service.capabilities`, and `service.status` are not modeled with this
-enum; they use ordinary HTTP status semantics (see `contract.json` for
+enum; they use ordinary status-code semantics (see `contract.json` for
 each one's exact status codes).
 
 ## `X-Acp-Outcome`
 
 Required on every `context.evaluate` and `context.resolve` (terminal)
 response, mirroring AALP's own `X-Aalp-Outcome` requirement exactly: two
-different outcomes can share the same HTTP status code (504 covers three
+different outcomes can share the same status code (504 covers three
 distinct outcomes, 502 covers two), so status code alone cannot always
 disambiguate which outcome actually happened. A client should treat this
 header's absence as a contract violation rather than guessing from the
@@ -175,7 +188,7 @@ identical).
 Coordinator internals (job dict entries, cache keys, lock state) and raw
 stored source content are never exposed in any form, in any version — see
 `excluded_from_this_interface` in `contract.json`. A conforming client
-only ever calls the six HTTP operations documented above and in
+only ever calls the six operations documented above and in
 `contract.json`. It never imports an `acp.*` Python module, never
 instantiates `Coordinator` directly, never calls a function not named on
 this page, and never reads `.acp/` state from disk beyond the two

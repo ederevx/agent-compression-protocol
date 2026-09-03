@@ -31,8 +31,7 @@ def _default_aalp_root() -> str | None:
 def build_ingress(
     aalp_root: str | Path | None = None,
     root: str | Path | None = None,
-    host: str = "127.0.0.1",
-    port: int = 0,
+    socket_path: str | Path | None = None,
 ) -> Ingress:
     """Construct a `Coordinator` and the `Ingress` that serves it.
 
@@ -59,8 +58,7 @@ def build_ingress(
     return Ingress(
         build_handler(coordinator),
         root=root,
-        host=host,
-        port=port,
+        socket_path=socket_path,
     )
 
 
@@ -75,26 +73,25 @@ def main(argv: list[str] | None = None) -> int:
         "--root", type=str, default=None,
         help="ACP state root, i.e. where .acp/ lives (default: ACP_HOME "
              "env var, else the current working directory).")
-    parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument(
-        "--port", type=int, default=0,
-        help="0 (default) binds an OS-assigned ephemeral port, published "
-             "via .acp/state/ingress.json for clients to discover.")
+        "--socket-path", type=str, default=None,
+        help="Unix socket path to bind (default: <root>/.acp/state/"
+             "ingress.sock, published via .acp/state/ingress.json for "
+             "clients to discover).")
     args = parser.parse_args(argv)
 
     try:
         ingress = build_ingress(
             aalp_root=args.aalp_root,
             root=args.root,
-            host=args.host,
-            port=args.port,
+            socket_path=args.socket_path,
         )
     except ValueError as exc:
         print(f"acp: {exc}", file=sys.stderr)
         return 2
 
     ingress.start()
-    print(f"acp: listening on {args.host}:{ingress.port}", file=sys.stderr)
+    print(f"acp: listening on {ingress.socket_path}", file=sys.stderr)
 
     stop_event = threading.Event()
 

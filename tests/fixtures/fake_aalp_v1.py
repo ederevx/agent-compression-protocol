@@ -17,20 +17,33 @@ Usage:
 Starting the fake writes real `.aalp/state/ingress.json` and
 `.aalp/state/ingress.secret` files under `root`, so a client's bootstrap
 step is exercised against real files, not a mock.
+
+Speaks the same Unix-domain-socket, length-prefixed-JSON wire protocol as
+the real `aalp/ingress.py` (see its module docstring for the exact
+format) -- this fake was updated in lockstep with AALP's real ingress
+when interface v1's transport moved off HTTP, for the same reason: a
+socket read/write bounded by a single `settimeout()` call, rather than a
+cumulative deadline across every `recv()`/`send()` it takes, can silently
+let a slow multi-packet delivery run far past a caller's configured
+budget.
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import secrets
+import socket
 import stat
+import struct
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+
+_LENGTH_PREFIX = struct.Struct(">I")
 
 # Mirrors contract.json's outcomes.values.<outcome>.response_status_code
 # for every outcome other than "success" (which passes the programmed
@@ -88,17 +101,44 @@ class _ProgrammedResponse:
     delay: float = 0.0
 
 
+def _recv_exact(sock: socket.socket, n: int) -> bytes:
+    chunks = []
+    remaining = n
+    while remaining > 0:
+        chunk = sock.recv(remaining)
+        if not chunk:
+            raise ConnectionError(
+                "peer closed the connection before sending all expected bytes")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _read_frame(sock: socket.socket, max_frame_bytes: int) -> bytes:
+    header = _recv_exact(sock, _LENGTH_PREFIX.size)
+    (length,) = _LENGTH_PREFIX.unpack(header)
+    if length > max_frame_bytes:
+        raise ValueError(f"frame length {length} exceeds max_frame_bytes {max_frame_bytes}")
+    return _recv_exact(sock, length)
+
+
+def _write_frame(sock: socket.socket, payload: bytes) -> None:
+    sock.sendall(_LENGTH_PREFIX.pack(len(payload)) + payload)
+
+
 class FakeAalpV1:
-    """A real loopback HTTP server implementing interface v1's three operations."""
+    """A real loopback Unix-socket server implementing interface v1's
+    three operations."""
+
+    _MAX_FRAME_BYTES = 64 * 1024 * 1024
+    _ACCEPT_POLL_SECONDS = 0.2
 
     def __init__(
         self,
         root: str | Path,
-        host: str = "127.0.0.1",
         capabilities: list[str] | None = None,
     ) -> None:
         self.root = Path(root)
-        self.host = host
         self.capabilities_list = (
             list(capabilities) if capabilities is not None else list(_DEFAULT_CAPABILITIES)
         )
@@ -109,35 +149,49 @@ class FakeAalpV1:
         self._programmed: dict[tuple[str, str], deque[_ProgrammedResponse]] = {}
         self.last_headers: Any = None  # last request.forward call's headers, for assertions
 
-        self._httpd: ThreadingHTTPServer | None = None
+        self.socket_path = self.root / ".aalp" / "state" / "ingress.sock"
+        self._server_socket: socket.socket | None = None
         self._thread: threading.Thread | None = None
+        self._stop_requested = threading.Event()
 
     # -- lifecycle ----------------------------------------------------------
 
     def start(self) -> "FakeAalpV1":
-        self._httpd = ThreadingHTTPServer((self.host, 0), _build_handler(self))
-        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+        self.socket_path.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.socket_path.parent, 0o700)
+        try:
+            self.socket_path.unlink()
+        except FileNotFoundError:
+            pass
+
+        server_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server_socket.bind(str(self.socket_path))
+        os.chmod(self.socket_path, 0o600)
+        server_socket.listen(128)
+        server_socket.settimeout(self._ACCEPT_POLL_SECONDS)
+        self._server_socket = server_socket
+
+        self._thread = threading.Thread(target=self._serve_forever, daemon=True)
         self._thread.start()
         self._write_bootstrap_files()
         return self
 
     def stop(self) -> None:
-        if self._httpd is not None:
-            self._httpd.shutdown()
-            self._httpd.server_close()
+        self._stop_requested.set()
         if self._thread is not None:
             self._thread.join(timeout=5)
+        if self._server_socket is not None:
+            self._server_socket.close()
+        try:
+            self.socket_path.unlink()
+        except FileNotFoundError:
+            pass
 
     def __enter__(self) -> "FakeAalpV1":
         return self.start()
 
     def __exit__(self, *exc_info: object) -> None:
         self.stop()
-
-    @property
-    def port(self) -> int:
-        assert self._httpd is not None
-        return self._httpd.server_address[1]
 
     def _write_bootstrap_files(self) -> None:
         state_dir = self.root / ".aalp" / "state"
@@ -149,7 +203,7 @@ class FakeAalpV1:
         secret_path.write_text(self.secret + "\n", encoding="utf-8")
         os.chmod(secret_path, stat.S_IRUSR | stat.S_IWUSR)
 
-        descriptor = {"host": self.host, "port": self.port, "secret_file": str(secret_path)}
+        descriptor = {"socket_path": str(self.socket_path), "secret_file": str(secret_path)}
         (state_dir / "ingress.json").write_text(json.dumps(descriptor), encoding="utf-8")
 
     # -- configuration --------------------------------------------------------
@@ -181,7 +235,7 @@ class FakeAalpV1:
         with self._lock:
             self._programmed.setdefault((provider_id, path), deque()).append(entry)
 
-    # -- request handling, called from the HTTP handler --------------------
+    # -- request handling, called from the socket-serving loop --------------
 
     def check_auth(self, authorization_header: str | None) -> bool:
         return authorization_header == f"Bearer {self.secret}"
@@ -234,88 +288,95 @@ class FakeAalpV1:
         headers = {"X-Aalp-Outcome": outcome, "Content-Type": "application/json"}
         return status if status is not None else _OUTCOME_STATUS[outcome], headers, body
 
+    # -- socket server --------------------------------------------------------
 
-def _build_handler(fake: FakeAalpV1) -> type[BaseHTTPRequestHandler]:
-    class Handler(BaseHTTPRequestHandler):
-        protocol_version = "HTTP/1.1"
-
-        def log_message(self, fmt: str, *args: object) -> None:  # silence stdlib access log
-            pass
-
-        def do_GET(self) -> None:
-            self._dispatch()
-
-        def do_POST(self) -> None:
-            self._dispatch()
-
-        def do_PUT(self) -> None:
-            self._dispatch()
-
-        def do_PATCH(self) -> None:
-            self._dispatch()
-
-        def do_DELETE(self) -> None:
-            self._dispatch()
-
-        def _write_json(self, status: int, obj: dict) -> None:
-            self._write_raw(status, {"Content-Type": "application/json"}, json.dumps(obj).encode())
-
-        def _write_raw(self, status: int, headers: dict[str, str], body: bytes) -> None:
-            self.send_response(status)
-            for name, value in headers.items():
-                self.send_header(name, value)
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            if body:
-                self.wfile.write(body)
-
-        def _dispatch(self) -> None:
-            # Mirrors aalp/ingress.py's real requirement: every request,
-            # GET included, must carry Content-Length or the real ingress
-            # 400s it. Enforcing that here too (rather than defaulting a
-            # missing header to 0) is what would have caught ACP's own
-            # discovery-request bug -- omitting Content-Length on a
-            # body-less GET -- in this fixture's own test suite instead
-            # of only via a live activation run.
-            length_header = self.headers.get("Content-Length")
-            if length_header is None:
-                self._write_raw(400, {}, b"missing Content-Length")
-                return
-            length = int(length_header)
-            if length:
-                self.rfile.read(length)  # request bodies are unused by this fake
-            path = self.path
-
-            if not fake.check_auth(self.headers.get("Authorization")):
-                self._write_json(401, {"error": "unauthorized"})
-                return
-
-            if self.command == "GET" and path == "/_aalp/v1/capabilities":
-                self._write_json(200, fake.capabilities_body())
-                return
-            if self.command == "GET" and path == "/_aalp/v1/providers":
-                self._write_json(200, fake.list_providers_body())
-                return
-            if self.command == "GET" and path.startswith("/_aalp/v1/providers/"):
-                provider_id = path[len("/_aalp/v1/providers/"):]
-                status_obj = fake.provider_status_body(provider_id)
-                if status_obj is None:
-                    self._write_json(404, {"error": "provider_not_found", "provider_id": provider_id})
-                else:
-                    self._write_json(200, status_obj)
-                return
-            if path.startswith("/_aalp/"):
-                self._write_json(404, {"error": "not_found"})
-                return
-
-            segment, _, rest = path.lstrip("/").partition("/")
-            upstream_path = "/" + rest if rest else ""
-            fake.last_headers = self.headers
+    def _serve_forever(self) -> None:
+        while not self._stop_requested.is_set():
             try:
-                status, headers, body = fake.handle_forward(segment, upstream_path)
-            except LookupError as exc:
-                self._write_raw(500, {"Content-Type": "text/plain"}, str(exc).encode())
+                connection, _ = self._server_socket.accept()
+            except socket.timeout:
+                continue
+            except OSError:
                 return
-            self._write_raw(status, headers, body)
+            thread = threading.Thread(
+                target=self._handle_connection, args=(connection,), daemon=True)
+            thread.start()
 
-    return Handler
+    @staticmethod
+    def _encode_response(status: int, headers: dict[str, str] | None, body: bytes) -> bytes:
+        envelope = {
+            "status": status,
+            "headers": dict(headers or {}),
+            "body": base64.b64encode(body or b"").decode("ascii"),
+        }
+        return json.dumps(envelope).encode("utf-8")
+
+    def _handle_connection(self, connection: socket.socket) -> None:
+        with connection:
+            try:
+                try:
+                    payload = _read_frame(connection, self._MAX_FRAME_BYTES)
+                except ValueError:
+                    _write_frame(
+                        connection,
+                        self._encode_response(413, {}, b"request body too large"))
+                    return
+
+                try:
+                    envelope = json.loads(payload.decode("utf-8"))
+                    method = envelope["method"]
+                    path = envelope["path"]
+                    headers = envelope["headers"]
+                    raw_body = envelope.get("body") or ""
+                    _ = base64.b64decode(raw_body) if raw_body else b""
+                except Exception:
+                    _write_frame(
+                        connection,
+                        self._encode_response(400, {}, b"malformed request envelope"))
+                    return
+
+                if not self.check_auth(headers.get("Authorization")):
+                    _write_frame(
+                        connection, self._encode_response(401, {}, json.dumps(
+                            {"error": "unauthorized"}).encode()))
+                    return
+
+                try:
+                    status, response_headers, response_body = self._dispatch(
+                        method, path, headers)
+                except LookupError as exc:
+                    _write_frame(
+                        connection,
+                        self._encode_response(500, {"Content-Type": "text/plain"}, str(exc).encode()))
+                    return
+                _write_frame(
+                    connection,
+                    self._encode_response(status, response_headers, response_body))
+            except (ConnectionError, OSError):
+                pass  # peer went away mid-request/response; nothing more to do
+
+    def _dispatch(
+        self, method: str, path: str, headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], bytes]:
+        if method == "GET" and path == "/_aalp/v1/capabilities":
+            body = json.dumps(self.capabilities_body()).encode()
+            return 200, {"Content-Type": "application/json"}, body
+        if method == "GET" and path == "/_aalp/v1/providers":
+            body = json.dumps(self.list_providers_body()).encode()
+            return 200, {"Content-Type": "application/json"}, body
+        if method == "GET" and path.startswith("/_aalp/v1/providers/"):
+            provider_id = path[len("/_aalp/v1/providers/"):]
+            status_obj = self.provider_status_body(provider_id)
+            if status_obj is None:
+                body = json.dumps(
+                    {"error": "provider_not_found", "provider_id": provider_id}).encode()
+                return 404, {"Content-Type": "application/json"}, body
+            return 200, {"Content-Type": "application/json"}, json.dumps(status_obj).encode()
+        if path.startswith("/_aalp/"):
+            body = json.dumps({"error": "not_found"}).encode()
+            return 404, {"Content-Type": "application/json"}, body
+
+        segment, _, rest = path.lstrip("/").partition("/")
+        upstream_path = "/" + rest if rest else ""
+        self.last_headers = headers
+        return self.handle_forward(segment, upstream_path)

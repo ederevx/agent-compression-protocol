@@ -1,16 +1,18 @@
-"""End-to-end tests for ACP interface v1 over a real loopback socket.
+"""End-to-end tests for ACP interface v1 over a real loopback Unix socket.
 
 Exercises `acp.serve.build_ingress` the same way `agent-api-lane-protocol`'s
 own `tests/test_serve.py` exercises `aalp.serve.build_ingress`: a real
 `Coordinator` wired to a real loopback `Ingress`, reachable only through
-interface v1's own HTTP surface -- the same path a genuine out-of-process
-client (a future host adapter) would take. Real `http.client.HTTPConnection`
-sockets throughout, no mocking of `http.server`.
+interface v1's own length-prefixed-JSON-over-`AF_UNIX` surface -- the same
+path a genuine out-of-process client (a future host adapter) would take.
+Real sockets throughout, no mocking of `acp.ingress`.
 """
 from __future__ import annotations
 
-import http.client
+import base64
 import json
+import socket
+import struct
 import tempfile
 import time
 import unittest
@@ -22,6 +24,21 @@ from acp.serve import build_ingress
 from tests.fixtures.fake_aalp_v1 import FakeAalpV1, FakeProvider
 
 _TIMEOUT = 5.0
+_LENGTH_PREFIX = struct.Struct(">I")
+
+
+class _FakeHTTPResponse:
+    """A minimal stand-in for `http.client.HTTPResponse` covering the two
+    members this test module's assertions use, so test bodies below did
+    not need to change when the transport moved off HTTP."""
+
+    def __init__(self, status: int, headers: dict[str, str], body: bytes) -> None:
+        self.status = status
+        self._headers = headers
+        self.body = body
+
+    def getheader(self, name: str, default: str | None = None) -> str | None:
+        return self._headers.get(name, default)
 
 # > 32000 chars -> > 8000 estimated tokens (len // 4) -> GENERAL traffic
 # class INSPECT, not BYPASS (bypass_max=8000). Mirrors tests/test_coordinator.py.
@@ -60,12 +77,42 @@ class AcpServeEndToEndTest(unittest.TestCase):
         self.ingress.start()
         self.addCleanup(self.ingress.stop)
 
-    # -- HTTP helpers -----------------------------------------------------
+    # -- socket helpers -----------------------------------------------------
 
-    def _connection(self) -> http.client.HTTPConnection:
-        return http.client.HTTPConnection(
-            "127.0.0.1", self.ingress.port, timeout=_TIMEOUT
-        )
+    def _recv_exact(self, sock: socket.socket, n: int) -> bytes:
+        chunks = []
+        remaining = n
+        while remaining > 0:
+            chunk = sock.recv(remaining)
+            if not chunk:
+                raise ConnectionError("peer closed before sending all expected bytes")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
+    def _call(
+        self, method: str, path: str, headers: dict | None = None, body: bytes = b""
+    ) -> _FakeHTTPResponse:
+        envelope = json.dumps({
+            "method": method,
+            "path": path,
+            "headers": headers or {},
+            "body": base64.b64encode(body).decode("ascii") if body else "",
+        }).encode("utf-8")
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(_TIMEOUT)
+        try:
+            sock.connect(str(self.ingress.socket_path))
+            sock.sendall(_LENGTH_PREFIX.pack(len(envelope)) + envelope)
+            header = self._recv_exact(sock, _LENGTH_PREFIX.size)
+            (length,) = _LENGTH_PREFIX.unpack(header)
+            payload = self._recv_exact(sock, length)
+        finally:
+            sock.close()
+        response = json.loads(payload.decode("utf-8"))
+        raw_body = response.get("body") or ""
+        response_body = base64.b64decode(raw_body) if raw_body else b""
+        return _FakeHTTPResponse(response["status"], dict(response.get("headers") or {}), response_body)
 
     def _auth_headers(self, extra: dict | None = None) -> dict:
         headers = {"Authorization": f"Bearer {self.ingress.secret}"}
@@ -73,33 +120,21 @@ class AcpServeEndToEndTest(unittest.TestCase):
             headers.update(extra)
         return headers
 
-    def _get(self, path: str, *, authorized: bool = True) -> tuple[http.client.HTTPResponse, bytes]:
-        headers = self._auth_headers({"Content-Length": "0"}) if authorized else {"Content-Length": "0"}
-        connection = self._connection()
-        try:
-            connection.request("GET", path, headers=headers)
-            response = connection.getresponse()
-            body = response.read()
-            return response, body
-        finally:
-            connection.close()
+    def _get(self, path: str, *, authorized: bool = True) -> tuple[_FakeHTTPResponse, bytes]:
+        headers = self._auth_headers() if authorized else {}
+        response = self._call("GET", path, headers)
+        return response, response.body
 
     def _post(
         self, path: str, body: bytes = b"", *, authorized: bool = True,
         content_type: str = "application/json",
-    ) -> tuple[http.client.HTTPResponse, bytes]:
+    ) -> tuple[_FakeHTTPResponse, bytes]:
         extra = {"Content-Type": content_type}
         headers = self._auth_headers(extra) if authorized else extra
-        connection = self._connection()
-        try:
-            connection.request("POST", path, body=body, headers=headers)
-            response = connection.getresponse()
-            response_body = response.read()
-            return response, response_body
-        finally:
-            connection.close()
+        response = self._call("POST", path, headers, body)
+        return response, response.body
 
-    def _post_json(self, path: str, obj: dict, **kwargs) -> tuple[http.client.HTTPResponse, dict]:
+    def _post_json(self, path: str, obj: dict, **kwargs) -> tuple[_FakeHTTPResponse, dict]:
         response, body = self._post(path, json.dumps(obj).encode("utf-8"), **kwargs)
         return response, json.loads(body)
 
@@ -321,8 +356,7 @@ class IngressDescriptorTest(AcpServeEndToEndTest):
         descriptor_path = self.acp_root / ".acp" / "state" / "ingress.json"
         self.assertTrue(descriptor_path.exists())
         descriptor = json.loads(descriptor_path.read_text())
-        self.assertEqual(descriptor["host"], "127.0.0.1")
-        self.assertEqual(descriptor["port"], self.ingress.port)
+        self.assertEqual(descriptor["socket_path"], str(self.ingress.socket_path))
 
         secret_path = self.acp_root / ".acp" / "state" / "ingress.secret"
         self.assertTrue(secret_path.exists())
