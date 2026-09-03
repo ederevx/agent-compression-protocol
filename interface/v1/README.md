@@ -61,7 +61,7 @@ line. ACP's ingress imposes no read/write deadline of its own; a caller
 enforces its own budgets as one cumulative deadline across however many
 individual socket reads/writes a call takes.
 
-## The six operations
+## The seven operations
 
 ### `context.evaluate` — SYNCHRONOUS GATE
 
@@ -127,9 +127,10 @@ provenance/audit registration, not as a retrieval store.
 
 `GET /v1/service/capabilities` → `{"service": "acp", "interface_version": 1, "capabilities": [...]}`
 
-The discovery entry point. v1 declares exactly the six capability strings
+The discovery entry point. v1 declares exactly the seven capability strings
 above, one per operation (`context.evaluate`, `context.prepare`,
-`context.resolve`, `context.pressure`, `source.store`, `service.status`).
+`context.resolve`, `context.pressure`, `source.store`, `service.status`,
+`service.telemetry`).
 
 ### `service.status`
 
@@ -138,6 +139,21 @@ return value directly: `policy_version`, `jobs_by_state` (a per-`JobState`
 count, never per-job detail), `aalp_reachable`, and a per-receiver
 `pressure` mode-name snapshot. Guaranteed, by `Coordinator.status()`'s own
 docstring, to never carry a raw payload or credential.
+
+### `service.telemetry`
+
+`GET /v1/service/telemetry` → `{"counters": {...}}`, every name in
+`acp.telemetry.COUNTER_NAMES` mapped to its current integer value —
+directly `acp.telemetry.Telemetry.snapshot()`'s own return value for the
+live `Coordinator`. Added additively in interface v1 (agent_protocols_v1_
+metadata_v1.md §21): before this operation existed, nothing outside the
+running `acp.service` process could read telemetry at all, since
+`service.status` deliberately excludes it. `service.telemetry` closes that
+gap without changing `service.status`'s existing response schema — a
+client that never adopts this capability keeps working exactly as before.
+Aggregate integer counts only; never a raw payload, compressed output, or
+per-job/per-cache-entry detail, so it does not fall under `coordinator.
+internal_state`'s exclusion below.
 
 ## Outcomes
 

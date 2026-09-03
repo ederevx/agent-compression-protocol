@@ -188,6 +188,60 @@ class CapabilitiesAndStatusTest(AcpServeEndToEndTest):
         self.assertNotIn(_BIG_PAYLOAD[:80], dumped)
 
 
+class TelemetryTest(AcpServeEndToEndTest):
+    def test_capabilities_lists_telemetry(self) -> None:
+        response, body = self._get("/v1/service/capabilities")
+        self.assertEqual(response.status, 200)
+        parsed = json.loads(body)
+        self.assertIn("service.telemetry", parsed["capabilities"])
+
+    def test_unauthorized_401s(self) -> None:
+        response, _ = self._get("/v1/service/telemetry", authorized=False)
+        self.assertEqual(response.status, 401)
+
+    def test_counters_start_at_zero_for_a_fresh_coordinator(self) -> None:
+        response, body = self._get("/v1/service/telemetry")
+        self.assertEqual(response.status, 200)
+        parsed = json.loads(body)
+        counters = parsed["counters"]
+        self.assertEqual(counters["compression_attempts"], 0)
+        self.assertEqual(counters["native_compression_fallbacks"], 0)
+
+    def test_real_compression_event_through_live_path_is_observable(self) -> None:
+        # A real INSPECT-mode round-trip through the live evaluate path
+        # (same fake-AALP convention as every other test in this module) --
+        # this is what §21's live-deployed-system observability gap
+        # requires: a client reading /v1/service/telemetry after the fact,
+        # not just the increment call being unit-tested in isolation.
+        self.fake.program_response(
+            "ci", "/v1/messages", outcome="success",
+            body=_compressor_body("COMPACT", "shrunk"),
+        )
+        evaluate_response, evaluate_body = self._post_json(
+            "/v1/context/evaluate",
+            {
+                "payload": _BIG_PAYLOAD,
+                "traffic_class": "general",
+                "receiver": {"host": "h", "session_id": "s", "agent_id": None},
+            },
+        )
+        self.assertEqual(evaluate_response.status, 200)
+        self.assertEqual(evaluate_body["outcome"], "success")
+
+        response, body = self._get("/v1/service/telemetry")
+        self.assertEqual(response.status, 200)
+        parsed = json.loads(body)
+        counters = parsed["counters"]
+        self.assertEqual(counters["compression_attempts"], 1)
+        self.assertEqual(counters["compression_successes"], 1)
+        self.assertGreater(counters["compression_input_tokens"], 0)
+        self.assertEqual(counters["native_compression_fallbacks"], 0)
+
+        dumped = json.dumps(parsed)
+        self.assertNotIn(self.fake.secret, dumped)
+        self.assertNotIn(self.ingress.secret, dumped)
+
+
 class EvaluateTest(AcpServeEndToEndTest):
     def test_evaluate_bypass_small_payload_needs_no_aalp_call(self) -> None:
         # No response programmed on the fake -- if ACP called AALP anyway,

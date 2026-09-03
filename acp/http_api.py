@@ -14,7 +14,7 @@ HTTP machinery involved. Putting the six-operation dispatch in this
 separate module keeps that split clean: `Coordinator` never imports
 `json` or knows an HTTP status code exists.
 
-Six operations, all under `/v1/...`, mirroring `interface/v1/contract.json`:
+Seven operations, all under `/v1/...`, mirroring `interface/v1/contract.json`:
 
     POST /v1/context/evaluate
     POST /v1/context/prepare
@@ -23,6 +23,7 @@ Six operations, all under `/v1/...`, mirroring `interface/v1/contract.json`:
     POST /v1/source/store           (raw binary body, not JSON)
     GET  /v1/service/capabilities
     GET  /v1/service/status
+    GET  /v1/service/telemetry
 """
 from __future__ import annotations
 
@@ -45,6 +46,7 @@ INTERFACE_V1_CAPABILITIES: tuple[str, ...] = (
     "context.pressure",
     "source.store",
     "service.status",
+    "service.telemetry",
 )
 
 # Mirrors agent-api-lane-protocol's aalp/gateway.py::_STATUS_BY_OUTCOME
@@ -261,6 +263,9 @@ def build_handler(coordinator: Coordinator) -> Handler:
     def _handle_status() -> tuple[int, dict[str, str], bytes]:
         return _json_response(200, coordinator.status())
 
+    def _handle_telemetry() -> tuple[int, dict[str, str], bytes]:
+        return _json_response(200, {"counters": coordinator.telemetry.snapshot()})
+
     def _handler(
         method: str,
         path: str,
@@ -286,6 +291,8 @@ def build_handler(coordinator: Coordinator) -> Handler:
                 return _handle_capabilities()
             if method == "GET" and segments == ["v1", "service", "status"]:
                 return _handle_status()
+            if method == "GET" and segments == ["v1", "service", "telemetry"]:
+                return _handle_telemetry()
         except _BadRequest as exc:
             return _error_response(400, str(exc))
         return _json_response(404, {"error": "not_found"})

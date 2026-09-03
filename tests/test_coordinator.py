@@ -215,7 +215,7 @@ class SweepStaleJobsTest(CoordinatorTestCase):
         )
         old_job_id = self.coordinator.prepare(_BIG_PAYLOAD, TrafficClass.GENERAL, _RECEIVER)
         self._wait_until_resolved(old_job_id)
-        self.coordinator._jobs[old_job_id].completed_at = time.time() - 1_000
+        self.coordinator._store.jobs[old_job_id].completed_at = time.time() - 1_000
 
         self.fake.program_response(
             "ci", "/v1/messages", outcome="success",

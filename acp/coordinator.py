@@ -107,6 +107,32 @@ _DEFAULT_FAILED_STATE = JobState.FAILED
 # BYPASSED/BLOCKED for real.
 
 
+class _JobStore:
+    """Groups the coordinator's job-tracking dicts as one private unit.
+
+    Purely a namespace for what were six loose `Coordinator` attributes
+    (`_jobs`, `_job_events`, `_results`, `_cache`, `_job_cache_keys`,
+    `_pending`); it owns no locking or invariants of its own; every
+    compound read/modify sequence across these dicts still happens under
+    `Coordinator._lock`, exactly as before. Nothing outside this module
+    constructs or touches a `_JobStore` -- ACP interface v1 (`context.
+    evaluate` / `context.prepare` / `context.resolve` / `context.pressure`
+    / `source.store` / `service.status`, per this module's docstring) and
+    every Claude/Codex host adapter only ever call `Coordinator`'s public
+    methods, so this is an internal-only regrouping with no client-visible
+    effect (§39 of agent_protocols_v1_background_compression_adjustment_
+    metadata_v1.md).
+    """
+
+    def __init__(self) -> None:
+        self.jobs: dict[str, Job] = {}
+        self.events: dict[str, threading.Event] = {}
+        self.results: dict[str, CompressionResult] = {}
+        self.cache: dict[tuple, str] = {}
+        self.cache_keys: dict[str, tuple] = {}
+        self.pending: dict[str, tuple] = {}
+
+
 class Coordinator:
     """Single owner of ACP's background/synchronous compression state."""
 
@@ -147,12 +173,7 @@ class Coordinator:
         # property (see module docstring) depends on cache-slot claiming
         # and job registration happening atomically under one lock.
         self._lock = threading.Lock()
-        self._jobs: dict[str, Job] = {}
-        self._job_events: dict[str, threading.Event] = {}
-        self._results: dict[str, CompressionResult] = {}
-        self._cache: dict[tuple, str] = {}
-        self._job_cache_keys: dict[str, tuple] = {}
-        self._pending: dict[str, tuple] = {}
+        self._store = _JobStore()
 
     @property
     def telemetry(self) -> Telemetry:
@@ -212,14 +233,14 @@ class Coordinator:
         )
         if state is JobState.RUNNING:
             transition(job, JobState.RUNNING)
-        self._jobs[job_id] = job
-        self._job_events[job_id] = threading.Event()
+        self._store.jobs[job_id] = job
+        self._store.events[job_id] = threading.Event()
         return job_id, job
 
     def _finalize_job(self, job_id: str, result: CompressionResult) -> None:
         new_state = _JOB_STATE_BY_OUTCOME.get(result.outcome, _DEFAULT_FAILED_STATE)
         with self._lock:
-            job = self._jobs[job_id]
+            job = self._store.jobs[job_id]
             transition(job, new_state)
             job.completed_at = time.time()
             if result.output is not None:
@@ -227,8 +248,8 @@ class Coordinator:
                     result.output if isinstance(result.output, bytes) else str(result.output)
                 )
                 job.result_ref = job.result_hash
-            self._results[job_id] = result
-            event = self._job_events[job_id]
+            self._store.results[job_id] = result
+            event = self._store.events[job_id]
             is_background = job.urgency_class != _SYNCHRONOUS_URGENCY
         event.set()
         if is_background:
@@ -280,17 +301,17 @@ class Coordinator:
         wait_event: threading.Event | None = None
 
         with self._lock:
-            job_id = self._cache.get(key)
-            job = self._jobs.get(job_id) if job_id is not None else None
+            job_id = self._store.cache.get(key)
+            job = self._store.jobs.get(job_id) if job_id is not None else None
 
             if job is not None and job.state is JobState.READY:
-                result = self._results[job_id]
+                result = self._store.results[job_id]
                 self._credit_reuse(job, synchronous=True)
                 return result
 
             if job is not None and job.state in (JobState.QUEUED, JobState.RUNNING):
                 wait_job_id = job_id
-                wait_event = self._job_events[job_id]
+                wait_event = self._store.events[job_id]
             else:
                 # No matching job, or a stale/terminal-non-ready one --
                 # per §21 that is never substituted. Register our own job
@@ -301,13 +322,13 @@ class Coordinator:
                 # to observe and coalesce onto *this* job instead of
                 # racing to create its own.
                 if job is not None:
-                    self._cache.pop(key, None)
+                    self._store.cache.pop(key, None)
                 own_job_id, _job = self._register_job(
                     source_hash, traffic_class, receiver_key, flow_id, payload,
                     urgency_class=_SYNCHRONOUS_URGENCY, state=JobState.RUNNING,
                 )
-                self._cache[key] = own_job_id
-                self._job_cache_keys[own_job_id] = key
+                self._store.cache[key] = own_job_id
+                self._store.cache_keys[own_job_id] = key
 
         if wait_event is not None:
             started_wait = time.monotonic()
@@ -317,8 +338,8 @@ class Coordinator:
 
             if finished:
                 with self._lock:
-                    waited_job = self._jobs.get(wait_job_id)
-                    result = self._results.get(wait_job_id)
+                    waited_job = self._store.jobs.get(wait_job_id)
+                    result = self._store.results.get(wait_job_id)
                 if result is not None and waited_job is not None:
                     self._credit_reuse(waited_job, synchronous=True)
                     return result
@@ -339,9 +360,9 @@ class Coordinator:
                 # (e.g. the original job was marked STALE and removed
                 # itself from the cache). If the original job is still
                 # actively running, leave its cache ownership alone.
-                if self._cache.get(key) is None:
-                    self._cache[key] = own_job_id
-                    self._job_cache_keys[own_job_id] = key
+                if self._store.cache.get(key) is None:
+                    self._store.cache[key] = own_job_id
+                    self._store.cache_keys[own_job_id] = key
         else:
             self._telemetry.increment("synchronous_gate_cache_misses")
 
@@ -368,8 +389,8 @@ class Coordinator:
         key = self._cache_key(source_hash, traffic_class)
 
         with self._lock:
-            job_id = self._cache.get(key)
-            job = self._jobs.get(job_id) if job_id is not None else None
+            job_id = self._store.cache.get(key)
+            job = self._store.jobs.get(job_id) if job_id is not None else None
 
             if job is not None and job.state in (
                 JobState.QUEUED, JobState.RUNNING, JobState.READY
@@ -378,15 +399,15 @@ class Coordinator:
                 return job_id
 
             if job is not None:
-                self._cache.pop(key, None)
+                self._store.cache.pop(key, None)
 
             job_id, _job = self._register_job(
                 source_hash, traffic_class, receiver_key, flow_id, payload,
                 urgency_class=urgency, state=JobState.QUEUED,
             )
-            self._cache[key] = job_id
-            self._job_cache_keys[job_id] = key
-            self._pending[job_id] = (payload, prior_provenance, flow_id)
+            self._store.cache[key] = job_id
+            self._store.cache_keys[job_id] = key
+            self._store.pending[job_id] = (payload, prior_provenance, flow_id)
             self._telemetry.increment("background_jobs_enqueued")
 
         thread = threading.Thread(target=self._run_background_job, args=(job_id,), daemon=True)
@@ -395,8 +416,8 @@ class Coordinator:
 
     def _run_background_job(self, job_id: str) -> None:
         with self._lock:
-            pending = self._pending.pop(job_id, None)
-            job = self._jobs.get(job_id)
+            pending = self._store.pending.pop(job_id, None)
+            job = self._store.jobs.get(job_id)
             if pending is None or job is None or job.state is not JobState.QUEUED:
                 # Marked STALE (or otherwise removed) before this thread
                 # got to run -- nothing to do, and per §31 a stale job
@@ -423,10 +444,10 @@ class Coordinator:
         `None` here rather than needing a special case.
         """
         with self._lock:
-            job = self._jobs.get(job_id)
+            job = self._store.jobs.get(job_id)
             if job is None or not is_terminal(job.state):
                 return None
-            return self._results.get(job_id)
+            return self._store.results.get(job_id)
 
     def mark_stale(self, job_id: str) -> Job:
         """Mark a not-yet-submitted background job STALE (§31).
@@ -440,7 +461,7 @@ class Coordinator:
         jobs`'s ordinary TTL expiry.
         """
         with self._lock:
-            job = self._jobs.get(job_id)
+            job = self._store.jobs.get(job_id)
             if job is None:
                 raise KeyError(f"unknown job_id {job_id!r}")
             if job.state is not JobState.QUEUED:
@@ -449,10 +470,10 @@ class Coordinator:
                     f"job {job_id!r} is {job.state.value}"
                 )
             transition(job, JobState.STALE)
-            cache_key = self._job_cache_keys.get(job_id)
-            if cache_key is not None and self._cache.get(cache_key) == job_id:
-                del self._cache[cache_key]
-            event = self._job_events.get(job_id)
+            cache_key = self._store.cache_keys.get(job_id)
+            if cache_key is not None and self._store.cache.get(cache_key) == job_id:
+                del self._store.cache[cache_key]
+            event = self._store.events.get(job_id)
         if event is not None:
             # Wake any synchronous waiter coalesced onto this job so it
             # can fall through to its own attempt immediately rather than
@@ -504,20 +525,20 @@ class Coordinator:
         now = time.time()
         removed: list[str] = []
         with self._lock:
-            for job_id, job in list(self._jobs.items()):
+            for job_id, job in list(self._store.jobs.items()):
                 if not is_terminal(job.state):
                     continue
                 reference_time = job.completed_at if job.completed_at is not None else job.created_at
                 if now - reference_time <= max_age_seconds:
                     continue
                 removed.append(job_id)
-                del self._jobs[job_id]
-                self._job_events.pop(job_id, None)
-                self._results.pop(job_id, None)
-                self._pending.pop(job_id, None)
-                cache_key = self._job_cache_keys.pop(job_id, None)
-                if cache_key is not None and self._cache.get(cache_key) == job_id:
-                    del self._cache[cache_key]
+                del self._store.jobs[job_id]
+                self._store.events.pop(job_id, None)
+                self._store.results.pop(job_id, None)
+                self._store.pending.pop(job_id, None)
+                cache_key = self._store.cache_keys.pop(job_id, None)
+                if cache_key is not None and self._store.cache.get(cache_key) == job_id:
+                    del self._store.cache[cache_key]
         return removed
 
     # -- status -----------------------------------------------------------
@@ -526,7 +547,7 @@ class Coordinator:
         """Bounded health/status. Never includes a raw payload or credential."""
         with self._lock:
             jobs_by_state: dict[str, int] = {}
-            for job in self._jobs.values():
+            for job in self._store.jobs.values():
                 jobs_by_state[job.state.value] = jobs_by_state.get(job.state.value, 0) + 1
             pressure_snapshot = self._pressure.snapshot()
 
