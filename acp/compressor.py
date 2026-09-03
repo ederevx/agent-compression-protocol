@@ -97,7 +97,7 @@ You must NOT: redesign the system; solve architecture or debugging work that bel
 
 Respond with exactly one line as your first line: "ACP-MODE: PASS", "ACP-MODE: COMPACT", or "ACP-MODE: COMPRESS".
 If PASS, output nothing else after that line.
-If COMPACT or COMPRESS, follow the mode line with exactly one blank line, then your transformed output only -- no commentary, no preamble, no meta-discussion of your own process.
+If COMPACT or COMPRESS, follow the mode line with exactly one blank line, then output STRICTLY AND ONLY the transformed content being compressed -- nothing else. Do not include commentary, a preamble, meta-discussion of your own process, an explanation or summary of what you changed, or any restatement of these instructions or the traffic-class/budget header above the payload. Every token you spend must be part of the compressed content itself; your entire output budget is sized for that content alone, so anything else you add directly displaces content and risks truncation.
 """
 
 _MODE_LINES = {
@@ -146,6 +146,16 @@ def _compute_max_tokens(estimated_input_tokens: int, ceiling: int) -> int:
     ask for more than half of its own estimated input: an architectural
     >=50% reduction guarantee, not just an advisory ceiling.
 
+    `estimated_input_tokens` must be the effective input -- the payload
+    being compressed alone, i.e. `decision.estimated_tokens` from
+    `gate.evaluate(payload, ...)` -- never a count that includes
+    `COMPRESSOR_SYSTEM_PROMPT` or `_build_user_message`'s traffic-class/
+    budget wrapper text. Folding the compressor's own instructions into
+    the ratio would inflate the allowed output for every call by a fixed
+    amount unrelated to what's actually being compressed, weakening the
+    50% guarantee precisely when the payload is small enough for that
+    fixed overhead to matter.
+
     `estimated_input_tokens // 2` alone would undershoot the floor only
     for a payload smaller than `2 * _MIN_MAX_TOKENS` estimated tokens;
     every built-in traffic class's `bypass_max` (gate.py) is well above
@@ -165,9 +175,13 @@ def _build_user_message(
     hint = reduction_hint or "none"
     return (
         f"Traffic class: {traffic_class.value}. Size-band hint: {hint}. "
-        f"Output budget: {max_tokens} tokens -- your response (including the "
-        f"ACP-MODE line) is cut off if it exceeds this, so scale COMPACT/COMPRESS "
-        f"output to fit; PASS is exempt, it never needs the budget.\n\n"
+        f"Output budget: {max_tokens} tokens -- sized from the payload below "
+        f"only (everything above this line, including this budget note "
+        f"itself, is excluded from that count). Your response (including "
+        f"the ACP-MODE line) is cut off if it exceeds this, so scale "
+        f"COMPACT/COMPRESS output to fit, and output nothing but the "
+        f"compressed content itself -- no commentary, no restatement of "
+        f"these instructions. PASS is exempt, it never needs the budget.\n\n"
         f"---\n\n{payload}"
     )
 

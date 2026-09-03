@@ -6,7 +6,12 @@ from pathlib import Path
 import json as _json
 
 from acp.aalp_client import AalpClient
-from acp.compressor import Compressor, FailurePolicy, _build_request_body, _compute_max_tokens
+from acp.compressor import (
+    Compressor,
+    FailurePolicy,
+    _build_request_body,
+    _compute_max_tokens,
+)
 from acp.errors import Outcome, TrafficClass
 from acp.provenance import compute_hash
 from acp.telemetry import Telemetry
@@ -185,6 +190,71 @@ class SuccessParsingTest(CompressorTestCase):
         self.assertIs(result.outcome, Outcome.SUCCESS)
         self.assertEqual(self.telemetry.get("compression_input_tokens"), len(_BIG_PAYLOAD) // 4)
         self.assertEqual(self.telemetry.get("compression_output_tokens"), 40 // 4)
+
+
+class MaxTokensCapExcludesWrapperTest(CompressorTestCase):
+    """The cap's `estimated_input_tokens` (fed to `_compute_max_tokens`
+    via `decision.estimated_tokens`) must be the payload alone -- never
+    a count that includes `COMPRESSOR_SYSTEM_PROMPT` or the traffic-
+    class/budget wrapper `_build_user_message` adds around it. Varying
+    the wrapper (different traffic class -> different hint text ->
+    different wrapper length) while holding the payload fixed must not
+    move the outbound `max_tokens` at all -- checked end-to-end through
+    `Compressor.compress()`, not just the helper functions, so a future
+    refactor that starts estimating off the full request still fails
+    this test.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.compressor = Compressor(
+            self.client, self.telemetry, max_tokens_ceiling=1_000_000
+        )
+
+    def test_max_tokens_unaffected_by_traffic_class_wrapper_length(self) -> None:
+        self._add_ci_provider()
+
+        self.fake.program_response(
+            "ci", "/v1/messages", outcome="success", body=_compressor_body("COMPACT", "ok"),
+        )
+        self.compressor.compress(_BIG_PAYLOAD, TrafficClass.GENERAL)
+        general_max_tokens = _json.loads(self.fake.last_body)["max_tokens"]
+
+        # NATIVE_AGENT_REPORT, not DOWNWARD_CONTEXT: DOWNWARD_CONTEXT's
+        # bypass_max (12,000) exceeds _BIG_PAYLOAD's ~10,000 estimated
+        # tokens, so it would BYPASS instead of INSPECT -- never reaching
+        # _compute_max_tokens at all, which would make this test pass
+        # for the wrong reason (no second request sent).
+        self.fake.program_response(
+            "ci", "/v1/messages", outcome="success", body=_compressor_body("COMPACT", "ok"),
+        )
+        self.compressor.compress(_BIG_PAYLOAD, TrafficClass.NATIVE_AGENT_REPORT)
+        other_max_tokens = _json.loads(self.fake.last_body)["max_tokens"]
+
+        self.assertEqual(general_max_tokens, other_max_tokens)
+
+
+class OutputOnlyCompressedContentPromptTest(unittest.TestCase):
+    """The compressor must be told, in both the system prompt and the
+    per-call user message, to output strictly and only the compressed
+    content -- no commentary/meta-discussion that would eat into the
+    now-tightened output budget."""
+
+    def test_system_prompt_forbids_commentary_and_meta_discussion(self) -> None:
+        body = _json.loads(
+            _build_request_body("payload", TrafficClass.GENERAL, None, "m", 512)
+        )
+        system = body["system"]
+        self.assertIn("STRICTLY AND ONLY", system)
+        self.assertIn("Do not include commentary", system)
+        self.assertIn("meta-discussion", system)
+
+    def test_user_message_reinforces_output_only_the_compressed_content(self) -> None:
+        body = _json.loads(
+            _build_request_body("payload", TrafficClass.GENERAL, None, "m", 512)
+        )
+        content = body["messages"][0]["content"]
+        self.assertIn("nothing but the compressed content itself", content)
 
 
 class MaxTokensCapTest(unittest.TestCase):
