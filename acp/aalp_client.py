@@ -186,7 +186,20 @@ class AalpClient:
             self._host, self._port, timeout=_DISCOVERY_TIMEOUT_SECONDS
         )
         try:
-            conn.request(method, path, headers={"Authorization": self._auth_header()})
+            # AALP's real ingress (aalp/ingress.py) 400s any request --
+            # GET included -- that omits Content-Length; a body-less
+            # http.client request never sends it by default. The tests
+            # covering this method only ran against the lenient
+            # FakeAalpV1 test fixture, which doesn't enforce the header,
+            # so this was only caught by a live activation run against
+            # the real AALP ingress.
+            conn.request(
+                method, path,
+                headers={
+                    "Authorization": self._auth_header(),
+                    "Content-Length": "0",
+                },
+            )
             response = conn.getresponse()
             body = response.read()
         except OSError as exc:

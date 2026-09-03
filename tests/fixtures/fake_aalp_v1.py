@@ -270,7 +270,18 @@ def _build_handler(fake: FakeAalpV1) -> type[BaseHTTPRequestHandler]:
                 self.wfile.write(body)
 
         def _dispatch(self) -> None:
-            length = int(self.headers.get("Content-Length", 0) or 0)
+            # Mirrors aalp/ingress.py's real requirement: every request,
+            # GET included, must carry Content-Length or the real ingress
+            # 400s it. Enforcing that here too (rather than defaulting a
+            # missing header to 0) is what would have caught ACP's own
+            # discovery-request bug -- omitting Content-Length on a
+            # body-less GET -- in this fixture's own test suite instead
+            # of only via a live activation run.
+            length_header = self.headers.get("Content-Length")
+            if length_header is None:
+                self._write_raw(400, {}, b"missing Content-Length")
+                return
+            length = int(length_header)
             if length:
                 self.rfile.read(length)  # request bodies are unused by this fake
             path = self.path
