@@ -10,24 +10,42 @@ usage; confirmed idempotent -- re-adding the same name just overwrites).
 
 `~/.codex/hooks.json` is touched additively, same discipline as the
 Claude installer: this repo's hook commands (identified by a stable
-marker substring in each `command`) are merged into `hooks.SubagentStart`,
-leaving every other event and every agent-mem-struct entry untouched.
+marker substring in each `command`) are merged into `hooks.SubagentStart`
+and `hooks.SubagentStop`, leaving every other event and every
+agent-mem-struct entry untouched.
 
-`hooks.PreToolUse` (matched to `spawn_agent`, for "parent -> child
-oversized support context") and shell-tool-exclusivity (disabling
-`shell_tool`/`unified_exec` via `codex features disable`, mirroring
-Claude's `permissions.deny: ["Bash"]`) are deliberately NOT installed by
-this script -- both are unconfirmed in this environment (the installed
-Codex CLI's ChatGPT backend was unreachable when this was built, so no
-live model turn could confirm either capability; Codex's own docs assert
-`PreToolUse.updatedInput` "should theoretically apply" to `spawn_agent`,
-but that is a documentation claim, not a verified one here). Pass
-`--with-parent-child-context` once `PreToolUse.updatedInput` on
-`spawn_agent` is empirically confirmed; pass `--disable-shell-tool` (or
-`--disable-unified-exec`) once one is confirmed to actually remove the
-native shell tool from the model's tool list.
+`hooks.SubagentStop` (C6/D4, enforced bounded retry for oversized
+subagent reports) is now installed unconditionally, mirroring the Claude
+installer: Codex's `SubagentStop` event was confirmed (2026-09-03
+follow-up pass, see `acp/adapters/hooks/subagent_report.py`'s module
+docstring and the evaluation doc's D4 addendum) to support a real
+`decision:"block"`/`reason` retry, with `stop_hook_active` as the
+recursion guard -- but unlike Claude, Codex showed no evidence of a
+host-side retry cap in live testing, so `subagent_report.py`'s handler
+is written to self-limit to exactly one block regardless. This is a
+declared install-time step only -- it takes effect on whichever host(s)
+this installer is actually run against next; it does not itself touch
+any live `~/.codex` config until run.
 
-Usage: python3 deploy/codex/install.py [--dry-run] [--with-parent-child-context]
+A `hooks.PreToolUse` hook matched to `spawn_agent` ("parent -> child
+oversized support context") was evaluated and empirically tested
+2026-09-03/04: Codex rejected the `updatedInput` mutation outright
+(`hook: PreToolUse Failed`) on both `spawn_agent`/`collaborationspawn_agent`
+and `collaborationwait_agent`, matching upstream `openai/codex#18491`'s
+account of `updatedInput` support being limited to `Bash`/`apply_patch`.
+Since Claude's equivalent capability was dropped to match (see
+`deploy/claude_code/install.py`), this script never offers it at all.
+
+Shell-tool-exclusivity (disabling `shell_tool`/`unified_exec` via `codex
+features disable`, mirroring Claude's `permissions.deny: ["Bash"]`) is
+deliberately NOT installed by this script -- unconfirmed in this
+environment (the installed Codex CLI's ChatGPT backend was unreachable
+when this was built, so no live model turn could confirm either
+capability). Pass `--disable-shell-tool` (or `--disable-unified-exec`)
+once one is confirmed to actually remove the native shell tool from the
+model's tool list.
+
+Usage: python3 deploy/codex/install.py [--dry-run]
                                         [--disable-shell-tool] [--disable-unified-exec]
 """
 from __future__ import annotations
@@ -51,7 +69,6 @@ def _hook_command(module: str) -> str:
 
 
 _SUBAGENT_REPORT_MODULE = "acp.adapters.hooks.subagent_report"
-_PARENT_CHILD_CONTEXT_MODULE = "acp.adapters.hooks.parent_child_context"
 
 
 def _load_json(path: Path) -> dict:
@@ -134,7 +151,6 @@ def _disable_feature(feature: str, dry_run: bool) -> None:
 
 def install(
     dry_run: bool,
-    with_parent_child_context: bool,
     disable_shell_tool: bool,
     disable_unified_exec: bool,
 ) -> int:
@@ -144,11 +160,10 @@ def install(
     hook_specs = [
         ("SubagentStart", _SUBAGENT_REPORT_MODULE, "SubagentStart", dict(
             status_message="ACP: offer the report tool for a large final report", timeout=5)),
+        ("SubagentStop", _SUBAGENT_REPORT_MODULE, "SubagentStop", dict(
+            status_message="ACP: enforce report-tool use for oversized subagent output",
+            timeout=5)),
     ]
-    if with_parent_child_context:
-        hook_specs.append(("PreToolUse/spawn_agent", _PARENT_CHILD_CONTEXT_MODULE, "PreToolUse", dict(
-            status_message="ACP: compress delimited oversized support context",
-            timeout=30, matcher="spawn_agent")))
 
     hook_changes = {}
     for label, module, event_name, kwargs in hook_specs:
@@ -180,15 +195,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true",
                          help="Print what would change without writing or running commands.")
     parser.add_argument(
-        "--with-parent-child-context", action="store_true",
-        help=(
-            "Also install the PreToolUse/spawn_agent hook for oversized "
-            "support-context compression -- only once Codex's "
-            "PreToolUse.updatedInput is empirically confirmed to apply "
-            "to spawn_agent."
-        ),
-    )
-    parser.add_argument(
         "--disable-shell-tool", action="store_true",
         help="codex features disable shell_tool -- only once confirmed to make acp-bash exclusive.",
     )
@@ -198,7 +204,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     return install(
-        args.dry_run, args.with_parent_child_context,
+        args.dry_run,
         args.disable_shell_tool, args.disable_unified_exec,
     )
 

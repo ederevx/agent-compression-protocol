@@ -55,24 +55,30 @@ unless run with `--no-claude-code`).
   replace that after the fact either (agent_protocols_v1
   background-compression adjustment §29).
 
-`acp/adapters/hooks/` holds two more Phase 4 pieces, each a small
-host-neutral CLI script (`--agent claude|codex`) invoked as a hook
-subprocess, all failing open (silent no-op) on any ACP error:
+`acp/adapters/hooks/subagent_report.py` holds the remaining Phase 4/C6
+piece, a small host-neutral CLI script (`--agent claude|codex`) invoked as
+a hook subprocess, failing open (silent no-op) on any ACP error: on
+`SubagentStart`, it injects context telling the subagent about the
+`report` tool; on `SubagentStop`, it enforces that ask with a bounded
+block/retry (C6/D4) if the subagent's final report is oversized and
+`report` wasn't called -- confirmed live on both Claude and Codex, with
+Codex's handler self-limiting to exactly one block since (unlike Claude's
+8-block hard cap) no host-side retry cap was observed there.
 
-- `subagent_report.py`: on `SubagentStart`, injects context telling the
-  subagent about the `report` tool.
-- `parent_child_context.py`: on `PreToolUse` matched to the
-  subagent-spawning tool (`Task` on Claude, `spawn_agent` on Codex),
-  compresses only an explicit `<acp-context>...</acp-context>` block in
-  the prompt via `updatedInput`, leaving everything else untouched.
-  Confirmed live on Claude Code (`PreToolUse.updatedInput` does apply to
-  `Task`); unconfirmed on Codex in this environment.
+A prior "parent -> child oversized support context" hook
+(`parent_child_context.py`, `PreToolUse` on the subagent-spawning tool)
+was removed 2026-09-04: confirmed working on Claude, but Codex's
+equivalent input-rewrite mutation (`PreToolUse.updatedInput` on
+`spawn_agent`/`wait_agent`) was empirically tested and rejected outright
+by Codex itself (`hook: PreToolUse Failed`, matching upstream
+`openai/codex#18491`) -- a genuine, confirmed parity gap, not just an
+unverified one, so the capability was dropped on both hosts rather than
+kept as a Claude-only asymmetry.
 
 `deploy/claude_code/install.py` and `deploy/codex/install.py` install
 these additively into each host's live config -- `mcpServers.acp-bash`/
 `permissions.deny` (Claude) or `codex mcp add` (Codex), plus the hook
-entries into `hooks.SubagentStart`/`SubagentStop` (and,
-with `--with-parent-child-context`, `PreToolUse`). Every other existing
+entries into `hooks.SubagentStart`/`SubagentStop`. Every other existing
 key/entry (e.g. agent-mem-struct's hooks) is left untouched; re-running
 either script is a no-op once installed. Run with `--dry-run` to preview
 first -- these change tool/hook behavior for every session on the host
