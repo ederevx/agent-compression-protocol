@@ -463,13 +463,17 @@ class AalpClient:
     ) -> AalpQueueResult:
         """`{method} /{provider_id}/{path}` via `request.queue` instead of
         `request.forward` (interface v1's `X-Aalp-Queue-Key` trigger
-        header). Stage 1: AALP always builds and seals a singleton
-        generation before delegating to the same pipeline `forward()` uses,
-        so this call's timeout/outcome behavior is identical to `forward()`
-        -- the only difference is the two generation-metadata response
-        headers, surfaced here as `AalpQueueResult.generation_id`/
-        `member_count`. Real multi-member accumulation (Stage 3) will not
-        change this method's signature.
+        header). AALP may coalesce this call's member into a generation
+        shared with other concurrent same-`queue_key` submissions (§6-§13)
+        -- this method has no visibility into that and does not need any:
+        `queue_timeout`/`compression_timeout`/`total_timeout` are still
+        just this one call's own budgets, timed from this call's own
+        invocation (never from a generation's seal instant, per §21 -- a
+        member joining an already-waiting generation must not inherit a
+        shorter or longer deadline than it would have gotten alone). The
+        two generation-metadata response headers are surfaced here as
+        `AalpQueueResult.generation_id`/`member_count`, which may differ
+        from call to call as generations open, fill, and seal.
         """
         self._ensure_bootstrapped()
 
