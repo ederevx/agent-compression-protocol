@@ -72,7 +72,28 @@ Per explicit user direction after reviewing this evaluation: proceed to (1) stag
 
 ### Live-probe and implementation log
 
-*(populated as work proceeds)*
+**2026-09-03 — Claude-side live probes (all six DEFER items resolved)**
+
+Tested via isolated project-scoped `.claude/settings.json` in scratch directories (no live session config touched), driven by non-interactive `claude -p --dangerously-skip-permissions` invocations, mirroring the reproduction pattern from issue #68951.
+
+| Boundary | Prior verdict | Live-probe verdict | Evidence |
+|---|---|---|---|
+| PostToolUse **Read** replace | DEFER | **REJECT** | Hook fired (confirmed via log), model's final answer still quoted the real tool output, not the replacement marker — same failure class as Bash/WebFetch. |
+| PostToolUse **Grep** replace | DEFER | **REJECT** | Same result: hook fired, replacement ignored, real match line returned. |
+| PostToolUse **Glob** replace | DEFER | **REJECT** | Same result: hook fired, replacement ignored, real filename returned. |
+| PostToolUse **MCP tool** replace | DEFER | **ACCEPT** | Hook fired and replacement worked: model received the marker value, not the MCP server's real output (model even flagged the mismatch). `updatedToolOutput` is honored for MCP-tool results specifically. |
+| PostToolUse **Agent/Task** replace (C5) | REVISE | **REJECT** | Hook fired, but parent's final answer quoted the subagent's real report, not the replacement — same broken-for-built-in-tools class as Bash/Read/Grep/Glob. |
+| **SubagentStop** bounded retry (C6) | REVISE | **ACCEPT** | Clean result: `decision:"block"` (top-level field, not under `hookSpecificOutput`) forced one retry; parent only ever saw the subagent's final, post-retry report — the pre-block value never leaked. `stop_hook_active` correctly `false` on the first block, `true` on the second, confirming the recursion guard. |
+
+**Net conclusion**: `updatedToolOutput` is reliable *only* for MCP-tool output and does not extend to any tested built-in tool (Bash, WebFetch, Read, Grep, Glob) or to the Agent/Task tool's own result. `SubagentStop`'s block/retry mechanism is confirmed sound and safe to build on. This materially changes the v1.1 design: Claude-side native output-replacement work should target (a) new/existing MCP-tool output only, and (b) SubagentStop-driven enforced retry for subagent reports — not a general PostToolUse rewrite layer.
+
+**Revised Claude-side implementation set**, superseding §D's original two items:
+- **C4** — enable `--with-parent-child-context` (ACCEPT, unchanged).
+- **C6** — replace/augment the cooperative `SubagentStart`-injection ask for subagent report compression (`subagent_report.py`) with an enforced `SubagentStop` block/retry: if a subagent's final report exceeds a size threshold and the `report` tool was not called, block once with a reason instructing the subagent to call `report`, then allow through on retry (respecting the 8-block hard cap). This is a genuine reliability upgrade over "ask nicely via injected context," now empirically justified.
+- **C7** — SendMessage rewrite via `PreToolUse.updatedInput` (ACCEPT direction, unchanged, not yet built).
+- **New, not in original proposal scope**: MCP-tool `PostToolUse` output enforcement is now a confirmed-viable mechanism; worth evaluating as a fail-closed backstop for `acp-bash`'s own output (currently fail-open if the MCP server's own compression logic fails) in a later pass — flagged here, not in this implementation round's scope.
+
+Codex-side (D1/D2/D4) live probes pending — tracked separately below.
 
 ---
 
