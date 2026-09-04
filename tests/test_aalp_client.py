@@ -30,7 +30,8 @@ class CapabilitiesTest(AalpClientTestCase):
         self.assertEqual(
             set(caps["capabilities"]),
             {"request.forward", "provider.status", "provider.concurrency",
-             "request.timeout_outcomes", "service.maintenance"},
+             "request.timeout_outcomes", "service.maintenance",
+             "request.queue"},
         )
 
     def test_capability_list_is_configurable(self) -> None:
@@ -79,6 +80,50 @@ class ForwardSuccessTest(AalpClientTestCase):
         self.fake.program_response("ci", "/v1/chat", outcome="success")
         self.client.forward("ci", "POST", "/v1/chat")
         self.assertIsNone(self.fake.last_headers.get("X-Aalp-Flow-Id"))
+
+
+class QueueSingletonTest(AalpClientTestCase):
+    # Stage 1 scope: submit_queue_member() must behave identically to
+    # forward() plus carrying the two generation-metadata fields.
+
+    def test_success_matches_forward_plus_generation_metadata(self) -> None:
+        self._add_ci_provider()
+        self.fake.program_response(
+            "ci", "/v1/chat", outcome="success", status=201,
+            headers={"X-Upstream": "yes"}, body=b'{"ok": true}',
+        )
+        result = self.client.submit_queue_member(
+            "ci", "queue-key-1", "POST", "/v1/chat", body=b"{}")
+        self.assertIs(result.outcome, Outcome.SUCCESS)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.status, 201)
+        self.assertEqual(result.body, b'{"ok": true}')
+        self.assertEqual(result.headers.get("X-Upstream"), "yes")
+        self.assertTrue(result.generation_id)
+        self.assertEqual(result.member_count, 1)
+
+    def test_queue_key_header_sent(self) -> None:
+        self._add_ci_provider()
+        self.fake.program_response("ci", "/v1/chat", outcome="success")
+        self.client.submit_queue_member("ci", "queue-key-1", "POST", "/v1/chat")
+        self.assertEqual(self.fake.last_headers.get("X-Aalp-Queue-Key"), "queue-key-1")
+
+    def test_member_id_sent_when_provided(self) -> None:
+        self._add_ci_provider()
+        self.fake.program_response("ci", "/v1/chat", outcome="success")
+        self.client.submit_queue_member(
+            "ci", "queue-key-1", "POST", "/v1/chat", member_id="member-42")
+        self.assertEqual(self.fake.last_headers.get("X-Aalp-Queue-Member-Id"), "member-42")
+
+    def test_non_success_outcome_matches_forward_shape(self) -> None:
+        self._add_ci_provider()
+        self.fake.program_response(
+            "ci", "/v1/chat", outcome="unavailable", message="unavailable happened")
+        result = self.client.submit_queue_member("ci", "queue-key-1", "POST", "/v1/chat")
+        self.assertIs(result.outcome, Outcome.UNAVAILABLE)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, 503)
+        self.assertEqual(result.message, "unavailable happened")
 
 
 class ForwardNonSuccessOutcomeTest(AalpClientTestCase):

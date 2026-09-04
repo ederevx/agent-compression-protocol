@@ -32,6 +32,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import secrets
 import socket
 import stat
@@ -44,6 +45,20 @@ from pathlib import Path
 from typing import Any
 
 _LENGTH_PREFIX = struct.Struct(">I")
+
+# A caller's own real `submit_queue_member()` member id is only assigned
+# per-call (freshly random, agent_protocols_v1_queue_coalescing_adjustment
+# _metadata_v1.md §14 requires uniqueness within a generation), so a test
+# cannot know it ahead of time when calling `program_response()`. Callers
+# needing the compressor's canned response to carry the real id can use
+# this token as a placeholder in the programmed body; `handle_queue()`
+# substitutes the id it actually parsed out of the request's own
+# `member_block` before returning -- the same thing a real compressor
+# model does when it echoes back "the same id from the request"
+# (`acp.queue_codec.QUEUE_ISOLATION_ADDENDUM`).
+MEMBER_ID_TOKEN = "__ACP_TEST_MEMBER_ID__"
+
+_QUEUE_ITEM_RE = re.compile(r"^ACP-QUEUE-ITEM: (?P<id>.+)$", re.MULTILINE)
 
 # Mirrors contract.json's outcomes.values.<outcome>.response_status_code
 # for every outcome other than "success" (which passes the programmed
@@ -64,6 +79,7 @@ _DEFAULT_CAPABILITIES = [
     "provider.concurrency",
     "request.timeout_outcomes",
     "service.maintenance",
+    "request.queue",
 ]
 
 
@@ -291,6 +307,39 @@ class FakeAalpV1:
         headers = {"X-Aalp-Outcome": outcome, "Content-Type": "application/json"}
         return status if status is not None else _OUTCOME_STATUS[outcome], headers, body
 
+    def handle_queue(
+        self, provider_id: str, path: str, request_body: bytes
+    ) -> tuple[int, dict[str, str], bytes]:
+        """`request.queue`: identical to `handle_forward()` plus the two
+        generation-metadata headers (this fixture always answers as its
+        own singleton generation -- it does not implement real
+        coalescing; see `tests/fixtures/fake_aalp_v1_service.py` on the
+        AALP side for that). If the programmed response body contains
+        `MEMBER_ID_TOKEN`, it is replaced with the real member id parsed
+        out of the request's own envelope, since a test cannot know that
+        id (freshly random per call) ahead of time.
+        """
+        status, headers, body = self.handle_forward(provider_id, path)
+        headers = dict(headers)
+        headers["X-Aalp-Queue-Generation-Id"] = secrets.token_hex(8)
+        headers["X-Aalp-Queue-Member-Count"] = "1"
+        member_id = self._extract_member_id(request_body)
+        if member_id is not None:
+            token = MEMBER_ID_TOKEN.encode("utf-8")
+            if token in body:
+                body = body.replace(token, member_id.encode("utf-8"))
+        return status, headers, body
+
+    @staticmethod
+    def _extract_member_id(request_body: bytes) -> str | None:
+        try:
+            envelope = json.loads(request_body)
+            member_block = envelope["member_block"]
+        except (json.JSONDecodeError, KeyError, TypeError):
+            return None
+        match = _QUEUE_ITEM_RE.search(member_block)
+        return match.group("id").strip() if match else None
+
     # -- socket server --------------------------------------------------------
 
     def _serve_forever(self) -> None:
@@ -347,7 +396,7 @@ class FakeAalpV1:
                 self.last_body = body
                 try:
                     status, response_headers, response_body = self._dispatch(
-                        method, path, headers)
+                        method, path, headers, body)
                 except LookupError as exc:
                     _write_frame(
                         connection,
@@ -360,7 +409,7 @@ class FakeAalpV1:
                 pass  # peer went away mid-request/response; nothing more to do
 
     def _dispatch(
-        self, method: str, path: str, headers: dict[str, str]
+        self, method: str, path: str, headers: dict[str, str], body: bytes
     ) -> tuple[int, dict[str, str], bytes]:
         if method == "GET" and path == "/_aalp/v1/capabilities":
             body = json.dumps(self.capabilities_body()).encode()
@@ -383,4 +432,6 @@ class FakeAalpV1:
         segment, _, rest = path.lstrip("/").partition("/")
         upstream_path = "/" + rest if rest else ""
         self.last_headers = headers
+        if headers.get("X-Aalp-Queue-Key") is not None:
+            return self.handle_queue(segment, upstream_path, body)
         return self.handle_forward(segment, upstream_path)

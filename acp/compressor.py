@@ -7,25 +7,38 @@ only -- this module never talks to a provider directly and never falls
 back to native inference on failure; there is no such code path here.
 
 The wire shape is the Anthropic Messages API (`POST /v1/messages` on
-whichever AALP provider id is configured, default `"ci"`):
+whichever AALP provider id is configured, default `"ci"`), submitted via
+AALP's `request.queue` (`acp.aalp_client.submit_queue_member`) rather
+than `request.forward`: every call submits exactly one logical member of
+a possibly-shared physical generation (see `acp.queue_codec`'s
+`ACP-QUEUE/1` grammar) -- AALP may genuinely coalesce it with other
+concurrent calls sharing the same `queue_key` (§6-§13). Each call sends
+a self-describing envelope (`acp.queue_codec.build_queue_envelope`)
+rather than a fully-built physical body; AALP mechanically assembles the
+final Messages-shaped request from however many members land in the
+same generation:
 
     {
       "model": "<configurable>",
       "max_tokens": <computed>,
-      "system": "<COMPRESSOR_SYSTEM_PROMPT>",
-      "messages": [{"role": "user", "content": "<traffic-class preamble + payload>"}]
+      "system": "<COMPRESSOR_SYSTEM_PROMPT + queue_codec's isolation addendum>",
+      "messages": [{"role": "user", "content": "<one or more ACP-QUEUE-ITEM: <id>\\n... blocks, joined by AALP, plus a trailing ACP-QUEUE-MEMBER-COUNT: n>"}]
     }
 
-The compressor's first response line must be exactly one of
-`ACP-MODE: PASS`, `ACP-MODE: COMPACT`, `ACP-MODE: COMPRESS`. For PASS,
-ACP substitutes the original payload verbatim itself -- it never trusts
-whatever (if anything) the model echoes back after that line. For
-COMPACT/COMPRESS, everything after the mode line and its one blank
-line is the transformed output ACP returns.
+The compressor's response may therefore contain other, unknown-to-this-
+call members' blocks alongside this call's own. ACP extracts only its
+own member id's block (`acp.queue_codec.parse_queue_member_result`),
+whose first line must be exactly one of `ACP-MODE: PASS`,
+`ACP-MODE: COMPACT`, `ACP-MODE: COMPRESS`. For PASS, ACP substitutes the
+original payload verbatim itself -- it never trusts whatever (if
+anything) the model echoes back after that line. For COMPACT/COMPRESS,
+everything after the mode line and its one blank line is the transformed
+output ACP returns.
 """
 from __future__ import annotations
 
 import json
+import secrets
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,10 +47,12 @@ from typing import Any
 from acp import bypass
 from acp import gate
 from acp import provenance as provenance_mod
+from acp import queue_codec
 from acp.aalp_client import AalpClient
 from acp.errors import AcpResult, Outcome, TrafficClass
 from acp.gate import GateAction, TrafficClassThresholds
 from acp.provenance import Provenance
+from acp.queue_codec import QueueMemberRequest, QueueProtocolViolation
 from acp.telemetry import Telemetry
 from acp.warnings import CompressionWarningTracker
 
@@ -106,6 +121,15 @@ DEFAULT_TOTAL_TIMEOUT_SECONDS = 60.0
 DEFAULT_PROVIDER_ID = "ci"
 _FORWARD_PATH = "/v1/messages"
 
+# Where the assembled member train belongs inside the `shared` envelope
+# (agent_protocols_v1_queue_coalescing_adjustment_metadata_v1.md §11):
+# AALP deep-sets the joined train here once admission happens, replacing
+# `_CONTENT_SENTINEL` below. Generic path traversal on AALP's side --
+# this module is the only place that needs to know it's `messages[0]
+# .content` in Anthropic's Messages API shape.
+_CONTENT_PATH = ["messages", 0, "content"]
+_CONTENT_SENTINEL = "__ACP_QUEUE_PENDING_MEMBER_TRAIN__"
+
 COMPRESSOR_SYSTEM_PROMPT = """You are ACP's compression stage: a loss-minimizing context processor, not a task-solving agent.
 
 Given a payload, choose exactly one mode:
@@ -123,12 +147,6 @@ Respond with exactly one line as your first line: "ACP-MODE: PASS", "ACP-MODE: C
 If PASS, output nothing else after that line.
 If COMPACT or COMPRESS, follow the mode line with exactly one blank line, then output STRICTLY AND ONLY the transformed content being compressed -- nothing else. Do not include commentary, a preamble, meta-discussion of your own process, an explanation or summary of what you changed, or any restatement of these instructions or the traffic-class/budget header above the payload. Every token you spend must be part of the compressed content itself; your entire output budget is sized for that content alone, so anything else you add directly displaces content and risks truncation.
 """
-
-_MODE_LINES = {
-    "ACP-MODE: PASS": "PASS",
-    "ACP-MODE: COMPACT": "COMPACT",
-    "ACP-MODE: COMPRESS": "COMPRESS",
-}
 
 # UNAVAILABLE / INVALID_RESPONSE / UPSTREAM_ERROR have no dedicated
 # per-outcome counter in `acp.telemetry.COUNTER_NAMES` (only the three
@@ -262,35 +280,42 @@ def _build_request_body(
     model: str,
     target_tokens: int,
     max_tokens: int,
+    member_id: str,
     thinking_budget_tokens: int | None = None,
 ) -> bytes:
+    """Build this call's self-describing queue envelope (§10-§12) -- not
+    a fully-built physical request body. `shared` is the physical
+    request skeleton with `_CONTENT_SENTINEL` standing in for wherever
+    AALP will later deep-set the assembled member train (possibly
+    including other members this call has no visibility into, §9)."""
     if thinking_budget_tokens is not None:
         max_tokens = max(
             max_tokens, thinking_budget_tokens + _MIN_OUTPUT_HEADROOM_ABOVE_THINKING
         )
-    request = {
+    user_message = _build_user_message(
+        payload, traffic_class, reduction_hint, target_tokens, max_tokens
+    )
+    shared: dict[str, Any] = {
         "model": model,
         "max_tokens": max_tokens,
-        "system": COMPRESSOR_SYSTEM_PROMPT,
-        "messages": [
-            {
-                "role": "user",
-                "content": _build_user_message(
-                    payload, traffic_class, reduction_hint, target_tokens, max_tokens
-                ),
-            }
-        ],
+        "system": queue_codec.build_system_prompt(COMPRESSOR_SYSTEM_PROMPT),
+        "messages": [{"role": "user", "content": _CONTENT_SENTINEL}],
     }
     if thinking_budget_tokens is not None:
-        request["thinking"] = {
+        shared["thinking"] = {
             "type": "enabled",
             "budget_tokens": thinking_budget_tokens,
         }
-    return json.dumps(request).encode("utf-8")
+    member = QueueMemberRequest(member_id=member_id, content=user_message)
+    return queue_codec.build_queue_envelope(shared, _CONTENT_PATH, member)
 
 
-def _parse_compressor_response(body: bytes) -> tuple[str, str, dict[str, Any] | None]:
-    """Parse one Anthropic-Messages-shaped compressor response.
+def _parse_compressor_response(
+    body: bytes, member_id: str
+) -> tuple[str, str, dict[str, Any] | None]:
+    """Parse one Anthropic-Messages-shaped compressor response and
+    extract just `member_id`'s own result, ignoring any other members
+    that may have been coalesced into the same physical response (§9).
 
     Returns `(mode, transformed_text, usage)`. `transformed_text` is
     only meaningful for COMPACT/COMPRESS (the caller must ignore it and
@@ -321,15 +346,13 @@ def _parse_compressor_response(body: bytes) -> tuple[str, str, dict[str, Any] | 
             f"compressor response is not a parseable Messages-shaped body: {exc}"
         ) from exc
 
-    first_line, _, remainder = text.partition("\n")
-    mode = _MODE_LINES.get(first_line.strip())
-    if mode is None:
-        raise CompressorProtocolViolation(
-            f"missing or invalid ACP-MODE line, got {first_line.strip()!r}"
-        )
+    try:
+        result = queue_codec.parse_queue_member_result(text, member_id)
+    except QueueProtocolViolation as violation:
+        raise CompressorProtocolViolation(str(violation)) from violation
 
-    if remainder.startswith("\n"):
-        remainder = remainder[1:]
+    mode = result.mode
+    remainder = result.output
 
     usage = response_json.get("usage")
     if not isinstance(usage, dict):
@@ -441,30 +464,53 @@ class Compressor:
         self._telemetry.increment("compression_attempts")
         target_tokens = _compute_target_tokens(decision.estimated_tokens)
         max_tokens = _compute_max_tokens(decision.estimated_tokens)
+        # A fresh id per call, unlike Stage 2's fixed "solo": real
+        # coalescing (§6-§14) may land several concurrent compress()
+        # calls in the same physical generation, and §14 requires every
+        # member id within a generation to be distinct.
+        member_id = secrets.token_hex(8)
         body = _build_request_body(
             payload, traffic_class, decision.reduction_hint, self._model,
-            target_tokens, max_tokens, self._thinking_budget_tokens,
+            target_tokens, max_tokens, member_id, self._thinking_budget_tokens,
+        )
+
+        # request.queue rather than request.forward (§13's "queue-of-one
+        # uses the identical grammar" -- the same envelope shape is used
+        # whether or not this call ends up actually coalesced with
+        # others). `queue_key` identifies which physical requests are
+        # eligible to coalesce; it is scoped to everything that must
+        # match for a shared physical response to be valid for every
+        # member (provider, upstream path, model, thinking budget) --
+        # payload content is deliberately excluded, since that's exactly
+        # what coalescing is meant to combine across calls.
+        queue_key = (
+            f"acp-queue/1:{self._provider_id}:{_FORWARD_PATH}:"
+            f"{self._model}:{self._thinking_budget_tokens}"
         )
 
         started = time.monotonic()
-        forward_result = self._aalp_client.forward(
+        queue_result = self._aalp_client.submit_queue_member(
             self._provider_id,
+            queue_key,
             "POST",
             _FORWARD_PATH,
             headers={"Content-Type": "application/json"},
             body=body,
             flow_id=flow_id,
+            member_id=member_id,
             queue_timeout=self._queue_timeout,
             compression_timeout=self._compression_timeout,
             total_timeout=self._total_timeout,
         )
-        # `AalpClient.forward` does not hand back a queue/execution
-        # timing split, so only the whole round-trip is measured here,
-        # against `compression_execution_ms`.
+        # `AalpClient.submit_queue_member` does not hand back a queue/
+        # execution timing split, so only the whole round-trip is
+        # measured here, against `compression_execution_ms`.
+        # `queue_result.generation_id`/`member_count` are available for
+        # cross-member audit correlation but not yet consumed here.
         elapsed_seconds = time.monotonic() - started
 
-        outcome = forward_result.outcome
-        failure_message = forward_result.message
+        outcome = queue_result.outcome
+        failure_message = queue_result.message
         parsed_mode: str | None = None
         parsed_output: str | None = None
         usage: dict[str, Any] | None = None
@@ -472,7 +518,7 @@ class Compressor:
         if outcome is Outcome.SUCCESS:
             try:
                 parsed_mode, parsed_output, usage = _parse_compressor_response(
-                    forward_result.body
+                    queue_result.body, member_id
                 )
             except CompressorProtocolViolation as violation:
                 outcome = Outcome.INVALID_RESPONSE

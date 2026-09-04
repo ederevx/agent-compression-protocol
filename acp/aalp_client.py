@@ -87,6 +87,20 @@ class AalpForwardResult:
         return self.outcome is Outcome.SUCCESS
 
 
+@dataclass
+class AalpQueueResult(AalpForwardResult):
+    """The result of one `request.queue` call: identical to
+    `AalpForwardResult` plus the generation metadata Stage 1's
+    `X-Aalp-Queue-Generation-Id`/`X-Aalp-Queue-Member-Count` response
+    headers carry (agent_protocols_v1_queue_coalescing_adjustment
+    _metadata_v1.md §6-§9). Stage 1: `member_count` is always 1 -- real
+    coalescing is Stage 3 scope.
+    """
+
+    generation_id: str = ""
+    member_count: int = 0
+
+
 def _recv_exact(sock: socket.socket, n: int, deadline: float) -> bytes:
     """Read exactly `n` bytes, honoring a cumulative deadline across
     however many individual `recv()` calls it takes -- never a single
@@ -271,6 +285,124 @@ class AalpClient:
         except json.JSONDecodeError as exc:
             raise AalpProtocolError(f"{context} returned invalid JSON: {exc}") from exc
 
+    # -- shared connect/send/receive/timeout-budget logic ------------------
+
+    def _send_and_receive(
+        self,
+        method: str,
+        upstream_path: str,
+        outgoing_headers: dict[str, str],
+        body: bytes,
+        queue_timeout: float,
+        compression_timeout: float,
+        total_timeout: float,
+    ) -> tuple[Outcome, int | None, dict[str, str], bytes, str]:
+        """One connect + one framed request/response round trip, under the
+        same three-budget model `forward()` has always used (`queue_timeout`
+        bounds connecting, `compression_timeout` bounds one already-connected
+        send/receive, `total_timeout` bounds the call as a whole -- whichever
+        is exhausted first determines the outcome, with `TOTAL_TIMEOUT`
+        always winning over a narrower phase budget that ran out at
+        essentially the same moment). Shared by `forward()` and
+        `submit_queue_member()`, which differ only in which headers they
+        send and what they do with the response headers.
+
+        Returns `(outcome, status, response_headers, response_body,
+        message)`. `message` is populated only for a non-`SUCCESS` AALP-
+        reported outcome, parsed from AALP's synthesized JSON error body.
+        """
+        overall_deadline = time.monotonic() + total_timeout
+
+        connect_deadline = min(overall_deadline, time.monotonic() + queue_timeout)
+        remaining = connect_deadline - time.monotonic()
+        if remaining <= 0:
+            return (
+                Outcome.TOTAL_TIMEOUT, None, {}, b"",
+                "total_timeout budget exhausted before connect",
+            )
+        try:
+            sock = self._connect(remaining)
+        except socket.timeout:
+            if time.monotonic() >= overall_deadline:
+                return (
+                    Outcome.TOTAL_TIMEOUT, None, {}, b"",
+                    "connect exceeded total_timeout budget",
+                )
+            return (
+                Outcome.QUEUE_TIMEOUT, None, {}, b"",
+                "connect exceeded queue_timeout budget",
+            )
+        except OSError as exc:
+            return Outcome.UPSTREAM_ERROR, None, {}, b"", str(exc)
+
+        try:
+            request_deadline = min(overall_deadline, time.monotonic() + compression_timeout)
+            remaining = request_deadline - time.monotonic()
+            if remaining <= 0:
+                return (
+                    Outcome.TOTAL_TIMEOUT, None, {}, b"",
+                    "total_timeout budget exhausted before send",
+                )
+
+            envelope = json.dumps({
+                "method": method,
+                "path": upstream_path,
+                "headers": outgoing_headers,
+                "body": base64.b64encode(body).decode("ascii") if body else "",
+            }).encode("utf-8")
+
+            try:
+                _write_frame(sock, envelope, request_deadline)
+                response_payload = _read_frame(
+                    sock, request_deadline, _MAX_RESPONSE_FRAME_BYTES)
+            except (socket.timeout, TimeoutError):
+                if time.monotonic() >= overall_deadline:
+                    return (
+                        Outcome.TOTAL_TIMEOUT, None, {}, b"",
+                        "request/response exceeded total_timeout budget",
+                    )
+                return (
+                    Outcome.COMPRESSION_TIMEOUT, None, {}, b"",
+                    "request/response exceeded compression_timeout budget",
+                )
+            except (OSError, ConnectionError) as exc:
+                return Outcome.UPSTREAM_ERROR, None, {}, b"", str(exc)
+        finally:
+            sock.close()
+
+        try:
+            response = json.loads(response_payload.decode("utf-8"))
+            status = response["status"]
+            response_headers = dict(response.get("headers") or {})
+            raw_body = response.get("body") or ""
+            response_body = base64.b64decode(raw_body) if raw_body else b""
+        except Exception as exc:  # malformed response framing
+            return Outcome.INVALID_RESPONSE, None, {}, b"", str(exc)
+
+        aalp_outcome = response_headers.get("X-Aalp-Outcome")
+        if aalp_outcome is None:
+            raise AalpProtocolError(
+                "AALP response is missing the required X-Aalp-Outcome header "
+                "(interface v1, request.forward.response.x_aalp_outcome_header)"
+            )
+
+        if aalp_outcome == "success":
+            return Outcome.SUCCESS, status, response_headers, response_body, ""
+
+        outcome = _NON_SUCCESS_OUTCOMES.get(aalp_outcome)
+        if outcome is None:
+            raise AalpProtocolError(f"AALP reported an unknown outcome {aalp_outcome!r}")
+
+        message = ""
+        try:
+            parsed = json.loads(response_body)
+            if isinstance(parsed, dict):
+                message = parsed.get("message", "")
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            pass
+
+        return outcome, status, response_headers, response_body, message
+
     # -- request.forward ------------------------------------------------
 
     def forward(
@@ -292,14 +424,8 @@ class AalpClient:
         ACP-side budgets for this whole round-trip to AALP -- distinct
         from, and layered on top of, AALP's own internal admission/upstream
         timeout handling (which produces the AALP-reported `queue_timeout`
-        / `compression_timeout` / `total_timeout` outcomes below).
-        `queue_timeout` bounds connecting to AALP's ingress, `compression_
-        timeout` bounds one already-connected send/receive attempt, and
-        `total_timeout` bounds the call as a whole; whichever budget is
-        exhausted first determines the local `Outcome`, and if the overall
-        deadline is what actually ran out, that always wins as
-        `Outcome.TOTAL_TIMEOUT` even if a narrower phase budget also
-        elapsed at essentially the same moment.
+        / `compression_timeout` / `total_timeout` outcomes below). See
+        `_send_and_receive()` for exactly how the three budgets interact.
         """
         self._ensure_bootstrapped()
 
@@ -310,101 +436,66 @@ class AalpClient:
 
         upstream_path = "/" + provider_id + (path if path.startswith("/") else "/" + path)
 
-        overall_deadline = time.monotonic() + total_timeout
-
-        connect_deadline = min(overall_deadline, time.monotonic() + queue_timeout)
-        remaining = connect_deadline - time.monotonic()
-        if remaining <= 0:
-            return AalpForwardResult(
-                Outcome.TOTAL_TIMEOUT, message="total_timeout budget exhausted before connect"
-            )
-        try:
-            sock = self._connect(remaining)
-        except socket.timeout:
-            if time.monotonic() >= overall_deadline:
-                return AalpForwardResult(
-                    Outcome.TOTAL_TIMEOUT, message="connect exceeded total_timeout budget"
-                )
-            return AalpForwardResult(
-                Outcome.QUEUE_TIMEOUT, message="connect exceeded queue_timeout budget"
-            )
-        except OSError as exc:
-            return AalpForwardResult(Outcome.UPSTREAM_ERROR, message=str(exc))
-
-        try:
-            request_deadline = min(overall_deadline, time.monotonic() + compression_timeout)
-            remaining = request_deadline - time.monotonic()
-            if remaining <= 0:
-                return AalpForwardResult(
-                    Outcome.TOTAL_TIMEOUT, message="total_timeout budget exhausted before send"
-                )
-
-            envelope = json.dumps({
-                "method": method,
-                "path": upstream_path,
-                "headers": outgoing_headers,
-                "body": base64.b64encode(body).decode("ascii") if body else "",
-            }).encode("utf-8")
-
-            try:
-                _write_frame(sock, envelope, request_deadline)
-                response_payload = _read_frame(
-                    sock, request_deadline, _MAX_RESPONSE_FRAME_BYTES)
-            except (socket.timeout, TimeoutError):
-                if time.monotonic() >= overall_deadline:
-                    return AalpForwardResult(
-                        Outcome.TOTAL_TIMEOUT,
-                        message="request/response exceeded total_timeout budget",
-                    )
-                return AalpForwardResult(
-                    Outcome.COMPRESSION_TIMEOUT,
-                    message="request/response exceeded compression_timeout budget",
-                )
-            except (OSError, ConnectionError) as exc:
-                return AalpForwardResult(Outcome.UPSTREAM_ERROR, message=str(exc))
-        finally:
-            sock.close()
-
-        try:
-            response = json.loads(response_payload.decode("utf-8"))
-            status = response["status"]
-            response_headers = dict(response.get("headers") or {})
-            raw_body = response.get("body") or ""
-            response_body = base64.b64decode(raw_body) if raw_body else b""
-        except Exception as exc:  # malformed response framing
-            return AalpForwardResult(Outcome.INVALID_RESPONSE, message=str(exc))
-
-        aalp_outcome = response_headers.get("X-Aalp-Outcome")
-        if aalp_outcome is None:
-            raise AalpProtocolError(
-                "AALP response is missing the required X-Aalp-Outcome header "
-                "(interface v1, request.forward.response.x_aalp_outcome_header)"
-            )
-
-        if aalp_outcome == "success":
-            return AalpForwardResult(
-                Outcome.SUCCESS,
-                status=status,
-                headers=response_headers,
-                body=response_body,
-            )
-
-        outcome = _NON_SUCCESS_OUTCOMES.get(aalp_outcome)
-        if outcome is None:
-            raise AalpProtocolError(f"AALP reported an unknown outcome {aalp_outcome!r}")
-
-        message = ""
-        try:
-            parsed = json.loads(response_body)
-            if isinstance(parsed, dict):
-                message = parsed.get("message", "")
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            pass
-
+        outcome, status, response_headers, response_body, message = self._send_and_receive(
+            method, upstream_path, outgoing_headers, body,
+            queue_timeout, compression_timeout, total_timeout,
+        )
         return AalpForwardResult(
-            outcome,
-            status=status,
-            headers=response_headers,
-            body=response_body,
-            message=message,
+            outcome, status=status, headers=response_headers,
+            body=response_body, message=message,
+        )
+
+    # -- request.queue -----------------------------------------------------
+
+    def submit_queue_member(
+        self,
+        provider_id: str,
+        queue_key: str,
+        method: str,
+        path: str,
+        *,
+        headers: dict[str, str] | None = None,
+        body: bytes = b"",
+        flow_id: str | None = None,
+        member_id: str | None = None,
+        queue_timeout: float = 5.0,
+        compression_timeout: float = 30.0,
+        total_timeout: float = 60.0,
+    ) -> AalpQueueResult:
+        """`{method} /{provider_id}/{path}` via `request.queue` instead of
+        `request.forward` (interface v1's `X-Aalp-Queue-Key` trigger
+        header). AALP may coalesce this call's member into a generation
+        shared with other concurrent same-`queue_key` submissions (§6-§13)
+        -- this method has no visibility into that and does not need any:
+        `queue_timeout`/`compression_timeout`/`total_timeout` are still
+        just this one call's own budgets, timed from this call's own
+        invocation (never from a generation's seal instant, per §21 -- a
+        member joining an already-waiting generation must not inherit a
+        shorter or longer deadline than it would have gotten alone). The
+        two generation-metadata response headers are surfaced here as
+        `AalpQueueResult.generation_id`/`member_count`, which may differ
+        from call to call as generations open, fill, and seal.
+        """
+        self._ensure_bootstrapped()
+
+        outgoing_headers = dict(headers or {})
+        outgoing_headers["Authorization"] = self._auth_header()
+        if flow_id is not None:
+            outgoing_headers["X-Aalp-Flow-Id"] = flow_id
+        outgoing_headers["X-Aalp-Queue-Key"] = queue_key
+        if member_id is not None:
+            outgoing_headers["X-Aalp-Queue-Member-Id"] = member_id
+
+        upstream_path = "/" + provider_id + (path if path.startswith("/") else "/" + path)
+
+        outcome, status, response_headers, response_body, message = self._send_and_receive(
+            method, upstream_path, outgoing_headers, body,
+            queue_timeout, compression_timeout, total_timeout,
+        )
+        member_count_raw = response_headers.get("X-Aalp-Queue-Member-Count")
+        return AalpQueueResult(
+            outcome, status=status, headers=response_headers,
+            body=response_body, message=message,
+            generation_id=response_headers.get("X-Aalp-Queue-Generation-Id", ""),
+            member_count=int(member_count_raw) if member_count_raw is not None else 0,
         )
