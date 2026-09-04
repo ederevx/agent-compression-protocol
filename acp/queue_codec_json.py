@@ -82,6 +82,115 @@ QUEUE_JSON_ISOLATION_ADDENDUM = f"""This request follows an experimental {QUEUE_
 Respond with exactly one JSON object and nothing else -- no prose, no markdown fences, no text before or after it. The object's keys are the exact ids from each submitted ACP-QUEUE-ITEM line, one entry per submitted item, no more and no fewer. Each value is itself an object: {{"mode": "PASS"|"COMPACT"|"COMPRESS", "output": "<the transformed content, or an empty string after PASS>"}}. Never merge, omit, duplicate, or invent item ids; never nest one item's id or content inside another item's value."""
 
 
+# --- "Directly inject the format" variants -------------------------------
+#
+# QUEUE_JSON_ISOLATION_ADDENDUM above describes the required shape only in
+# prose ("the object's keys are...", "each value is itself an object..."),
+# leaving it to the model to translate that description into a concrete
+# structure. The two constructs below instead show the model a literal
+# structural target: a JSON skeleton embedded directly in the instructions
+# (still just prompt content, no API-level guarantee), and a real JSON
+# Schema document usable with a provider's own structured-output/
+# constrained-decoding feature (an actual guarantee, if the backend
+# supports it -- OpenAI-compatible APIs call this `response_format`).
+#
+# Neither of these can be shown to improve real compliance without a live
+# call against the actual backend, which stays gated behind this
+# prototype's live-activation authorization (unchanged from every other
+# stage/experiment in this project). What IS verifiable here, without a
+# live call, is that each construct is well-formed and says what it's
+# supposed to say -- that's what this module's own tests check.
+
+QUEUE_JSON_SKELETON_DICT_ADDENDUM = f"""This request follows an experimental {QUEUE_PROTOCOL_NAME}-JSON variant: it may contain one or more independent ITEMS, each introduced by a line "ACP-QUEUE-ITEM: <id>". Treat every ITEM as a fully isolated compression problem -- use only the content and metadata belonging to that ITEM, and never transfer facts, instructions, conclusions, assumptions, or context between ITEMS, even when several appear in the same request.
+
+Respond with exactly one JSON object matching this exact shape, and nothing else -- no prose, no markdown fences, no text before or after it:
+
+{{
+  "<the id from that item's own ACP-QUEUE-ITEM line>": {{"mode": "PASS", "output": ""}},
+  "<repeat one entry per submitted item, using each item's own real id>": {{"mode": "COMPACT", "output": "<transformed content>"}}
+}}
+
+Substitute each "<...>" placeholder with the real value for that item -- never emit the literal placeholder text. "mode" must be exactly one of "PASS", "COMPACT", or "COMPRESS" (case-sensitive, no other values). "output" must be a string: empty for PASS, the transformed content otherwise. Exactly one entry per submitted item id, no more, no fewer, no duplicates, no invented ids."""
+
+QUEUE_JSON_SKELETON_ARRAY_ADDENDUM = f"""This request follows an experimental {QUEUE_PROTOCOL_NAME}-JSON variant: it may contain one or more independent ITEMS, each introduced by a line "ACP-QUEUE-ITEM: <id>". Treat every ITEM as a fully isolated compression problem -- use only the content and metadata belonging to that ITEM, and never transfer facts, instructions, conclusions, assumptions, or context between ITEMS, even when several appear in the same request.
+
+Respond with exactly one JSON array matching this exact shape, and nothing else -- no prose, no markdown fences, no text before or after it:
+
+[
+  {{"id": "<the id from that item's own ACP-QUEUE-ITEM line>", "mode": "PASS", "output": ""}},
+  {{"id": "<repeat one entry per submitted item, using each item's own real id>", "mode": "COMPACT", "output": "<transformed content>"}}
+]
+
+Substitute each "<...>" placeholder with the real value for that item -- never emit the literal placeholder text. "mode" must be exactly one of "PASS", "COMPACT", or "COMPRESS" (case-sensitive, no other values). "output" must be a string: empty for PASS, the transformed content otherwise. Exactly one array entry per submitted item id, no more, no fewer, no duplicates, no invented ids."""
+
+
+# A real JSON Schema (draft 2020-12 vocabulary, but deliberately using only
+# widely-supported keywords) for the array shape -- usable as the `schema`
+# field of an OpenAI-compatible `response_format: {"type": "json_schema",
+# "json_schema": {"name": ..., "schema": ARRAY_RESPONSE_JSON_SCHEMA,
+# "strict": True}}` request field, for a backend that actually enforces it
+# via constrained decoding rather than merely reading it as a hint.
+#
+# The dict (id-keyed-object) shape's *value* shape can still be
+# schema-constrained even though its keys are runtime member ids unknown
+# at schema-authoring time (`additionalProperties: {<entry schema>}`
+# applies that entry schema to every key, whatever the key names turn out
+# to be) -- so per-entry type strictness is not actually the dict shape's
+# weak point versus a schema. Its real, irreducible weak point is
+# duplicate-key detection specifically: by the time any JSON Schema
+# validator (including a provider's own constrained-decoding pass, and
+# `jsonschema` package validation in this repo's own tests) ever sees the
+# data, standard `json.loads` has *already* silently resolved a duplicate
+# key to its last value -- the information that a duplicate ever existed
+# is gone before schema validation can run at all. Only a custom
+# `object_pairs_hook` (this module's `_reject_duplicate_keys`, used by
+# `parse_queue_member_result_json`) sees the raw key-value pairs in time
+# to catch it; no schema, provider-side or otherwise, can substitute for
+# that check. The array shape's duplicate-*id* problem is different: two
+# entries with the same "id" both survive parsing intact as distinct list
+# items, so it -- unlike the dict shape's problem -- is at least visible
+# post-parse, though the schema below still doesn't check for it (no
+# built-in JSON Schema keyword expresses "unique by one field of an
+# object" across array items); it is the caller's own
+# `parse_queue_member_result_json_array`, not schema validation, that
+# performs the check.  See
+# test_queue_codec_json_experiment.py::JsonSchemaInjectionTest.
+ARRAY_RESPONSE_JSON_SCHEMA: dict = {
+    "type": "array",
+    "minItems": 1,
+    "items": {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string", "minLength": 1},
+            "mode": {"type": "string", "enum": ["PASS", "COMPACT", "COMPRESS"]},
+            "output": {"type": "string"},
+        },
+        "required": ["id", "mode", "output"],
+        "additionalProperties": False,
+    },
+}
+
+
+def build_queue_response_format(*, strict: bool = True) -> dict:
+    """OpenAI-compatible `response_format` payload wrapping
+    `ARRAY_RESPONSE_JSON_SCHEMA` -- attach to the physical request body's
+    top level (a sibling of `model`/`messages`/`max_tokens`) for a backend
+    that supports constrained JSON-schema decoding. AALP forwards this
+    opaquely either way (`request_shape.passthrough: true`); a backend
+    that doesn't recognize the field is expected to ignore it, per that
+    same API convention's own documented behavior -- not verified here
+    against the real `ci` backend, which stays gated behind live-
+    activation."""
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "acp_queue_response_v1",
+            "schema": ARRAY_RESPONSE_JSON_SCHEMA,
+            "strict": strict,
+        },
+    }
+
+
 def _validate_fields(member_id: str, entry: dict, allowed_keys: frozenset) -> QueueMemberResult:
     extra = set(entry.keys()) - allowed_keys
     if extra:

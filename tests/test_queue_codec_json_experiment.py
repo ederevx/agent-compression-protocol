@@ -13,15 +13,26 @@ it's unsafe). None are wired into `compressor.py`/`aalp_client.py`.
 """
 from __future__ import annotations
 
+import json
 import unittest
 
 from acp.queue_codec import QueueProtocolViolation
 from acp.queue_codec_json import (
+    ARRAY_RESPONSE_JSON_SCHEMA,
+    QUEUE_JSON_SKELETON_ARRAY_ADDENDUM,
+    QUEUE_JSON_SKELETON_DICT_ADDENDUM,
+    build_queue_response_format,
     parse_queue_member_result_json,
     parse_queue_member_result_json_array,
     parse_queue_member_result_json_lenient_search,
     parse_queue_member_result_json_naive,
 )
+
+try:
+    import jsonschema
+    _HAS_JSONSCHEMA = True
+except ImportError:
+    _HAS_JSONSCHEMA = False
 
 _STRICT_PARSERS = (parse_queue_member_result_json, parse_queue_member_result_json_array)
 _ALL_DICT_SHAPED = (parse_queue_member_result_json_naive, parse_queue_member_result_json)
@@ -320,6 +331,134 @@ class LenientSearchIsUnsafeTest(unittest.TestCase):
     def test_naive_variant_also_rejects_the_same_text(self) -> None:
         with self.assertRaises(QueueProtocolViolation):
             parse_queue_member_result_json_naive(self._DECOY_THEN_REAL, "c-id")
+
+
+class SkeletonAddendumTest(unittest.TestCase):
+    """"Directly inject the format" variants: instead of describing the
+    required shape only in prose (`QUEUE_JSON_ISOLATION_ADDENDUM`), show
+    the model a literal JSON skeleton. Whether this actually improves real
+    model compliance is an empirical question this fixture-only prototype
+    cannot answer -- these tests only confirm the constructs say what
+    they're supposed to say, structurally."""
+
+    def test_dict_skeleton_contains_a_literal_json_object_example(self) -> None:
+        self.assertIn('"mode": "PASS"', QUEUE_JSON_SKELETON_DICT_ADDENDUM)
+        self.assertIn('"mode": "COMPACT"', QUEUE_JSON_SKELETON_DICT_ADDENDUM)
+        self.assertIn("{", QUEUE_JSON_SKELETON_DICT_ADDENDUM)
+        self.assertIn("}", QUEUE_JSON_SKELETON_DICT_ADDENDUM)
+
+    def test_array_skeleton_contains_a_literal_json_array_example(self) -> None:
+        self.assertIn('"id":', QUEUE_JSON_SKELETON_ARRAY_ADDENDUM)
+        self.assertIn("[", QUEUE_JSON_SKELETON_ARRAY_ADDENDUM)
+        self.assertIn("]", QUEUE_JSON_SKELETON_ARRAY_ADDENDUM)
+
+    def test_both_skeletons_warn_against_emitting_the_literal_placeholder(self) -> None:
+        # The most common failure mode of showing an example is the model
+        # echoing the placeholder text itself ("<the id from...>") instead
+        # of substituting a real value -- both addenda must say not to.
+        for addendum in (QUEUE_JSON_SKELETON_DICT_ADDENDUM, QUEUE_JSON_SKELETON_ARRAY_ADDENDUM):
+            with self.subTest(addendum=addendum[:40]):
+                self.assertIn("never emit the literal placeholder text", addendum)
+
+    def test_neither_skeleton_can_hardcode_real_member_ids(self) -> None:
+        # Architectural constraint, not an oversight: the system prompt is
+        # static-prefix, built by whichever call happens to become leader,
+        # before that call has any visibility into who (if anyone) it will
+        # be coalesced with (§9, §12) -- so the skeleton can only show a
+        # placeholder shape, never a literal list of real ids.
+        for addendum in (QUEUE_JSON_SKELETON_DICT_ADDENDUM, QUEUE_JSON_SKELETON_ARRAY_ADDENDUM):
+            with self.subTest(addendum=addendum[:40]):
+                self.assertIn("<", addendum)
+                self.assertIn(">", addendum)
+
+
+@unittest.skipUnless(_HAS_JSONSCHEMA, "jsonschema package not installed in this environment")
+class JsonSchemaInjectionTest(unittest.TestCase):
+    """Stronger than prompt wording: a real JSON Schema document, usable
+    with a provider's own structured-output/constrained-decoding feature
+    (`build_queue_response_format`). `jsonschema` is used here only as a
+    test-time conformance-checking aid -- it is not, and must not become,
+    a dependency of `acp/queue_codec_json.py` itself or any shipped code;
+    this repo is stdlib-only by convention (no requirements/pyproject
+    file exists here at all)."""
+
+    def test_conformant_array_validates(self) -> None:
+        sample = [
+            {"id": "a-id", "mode": "PASS", "output": ""},
+            {"id": "b-id", "mode": "COMPACT", "output": "shrunk"},
+        ]
+        jsonschema.validate(sample, ARRAY_RESPONSE_JSON_SCHEMA)
+
+    def test_missing_required_field_is_rejected(self) -> None:
+        sample = [{"id": "a-id", "mode": "PASS"}]  # no "output"
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(sample, ARRAY_RESPONSE_JSON_SCHEMA)
+
+    def test_invalid_mode_enum_value_is_rejected(self) -> None:
+        sample = [{"id": "a-id", "mode": "SUMMARIZE", "output": "x"}]
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(sample, ARRAY_RESPONSE_JSON_SCHEMA)
+
+    def test_unexpected_extra_field_is_rejected(self) -> None:
+        sample = [{"id": "a-id", "mode": "PASS", "output": "", "note": "extra"}]
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(sample, ARRAY_RESPONSE_JSON_SCHEMA)
+
+    def test_empty_array_is_rejected(self) -> None:
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate([], ARRAY_RESPONSE_JSON_SCHEMA)
+
+    def test_object_instead_of_array_is_rejected(self) -> None:
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate({"a-id": {"mode": "PASS", "output": ""}}, ARRAY_RESPONSE_JSON_SCHEMA)
+
+    def test_schema_validation_cannot_see_a_duplicate_key_already_resolved_by_json_loads(self) -> None:
+        # The precise, irreducible gap: by the time jsonschema (or any
+        # schema validator, provider-side or otherwise) sees the data,
+        # plain json.loads has already silently kept only the last of two
+        # duplicate keys -- the duplication itself leaves no trace for a
+        # schema to catch. This is why parse_queue_member_result_json
+        # needs its own object_pairs_hook and cannot rely on schema
+        # validation (of the dict shape) to catch this class of problem.
+        raw = (
+            '{"c-id": {"mode": "PASS", "output": "genuine"}, '
+            '"c-id": {"mode": "COMPACT", "output": "attacker-controlled-overwrite"}}'
+        )
+        parsed = json.loads(raw)  # plain json.loads, no object_pairs_hook
+        self.assertEqual(parsed, {"c-id": {"mode": "COMPACT", "output": "attacker-controlled-overwrite"}})
+        # A schema validating THIS shape (a dict, so DICT-shaped schema,
+        # not ARRAY_RESPONSE_JSON_SCHEMA) would see one perfectly
+        # conformant entry and have no way to know a second one ever
+        # existed and lost -- demonstrated directly by re-serializing and
+        # confirming the duplicate is simply absent, not merely hidden.
+        self.assertNotIn("attacker-controlled-overwrite is a duplicate", json.dumps(parsed))
+        self.assertEqual(len(parsed), 1)
+
+    def test_array_shape_duplicate_id_survives_parsing_but_schema_still_does_not_catch_it(self) -> None:
+        # Contrast: the array shape's duplicate-id problem DOES survive
+        # parsing (two distinct list entries, not a lost key) -- but no
+        # built-in JSON Schema keyword expresses "unique by one field of
+        # an object across array items" (uniqueItems checks whole-item
+        # equality, not just one field), so the schema still validates
+        # this array as conformant even though it has a real duplicate id.
+        # Catching it is parse_queue_member_result_json_array's own job
+        # (its explicit `seen_ids` check), not the schema's.
+        sample = [
+            {"id": "c-id", "mode": "PASS", "output": "genuine"},
+            {"id": "c-id", "mode": "COMPACT", "output": "attacker-controlled-overwrite"},
+        ]
+        jsonschema.validate(sample, ARRAY_RESPONSE_JSON_SCHEMA)  # does not raise
+        with self.assertRaises(QueueProtocolViolation):
+            parse_queue_member_result_json_array(json.dumps(sample), "c-id")
+
+    def test_build_queue_response_format_wraps_the_schema_correctly(self) -> None:
+        response_format = build_queue_response_format()
+        self.assertEqual(response_format["type"], "json_schema")
+        self.assertEqual(response_format["json_schema"]["schema"], ARRAY_RESPONSE_JSON_SCHEMA)
+        self.assertTrue(response_format["json_schema"]["strict"])
+        # The wrapper itself must also be valid, well-formed JSON --
+        # AALP forwards it opaquely, so nothing else will ever check this.
+        json.dumps(response_format)
 
 
 if __name__ == "__main__":
