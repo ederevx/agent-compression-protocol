@@ -23,8 +23,8 @@ hitting ACP's content-hash coalescing before expiring, never as a real,
 documented compression point. See `acp/coordinator.py`'s module
 docstring for the full removal rationale.
 
-`SubagentStop` enforced retry (C6, Claude-only)
-------------------------------------------------
+`SubagentStop` enforced retry (C6, Claude and Codex)
+-----------------------------------------------------
 Live-probe testing (2026-09-03, see `agent_protocols_v1_1_hook_enforced_
 io_compression_evaluation.md` §C6) empirically confirmed that on Claude
 Code, a `SubagentStop` hook returning a top-level (not under
@@ -38,12 +38,36 @@ with an enforced backstop: if the subagent ignores the ask and returns
 an oversized final report anyway, block once and tell it to call
 `report` before finishing.
 
-This is Claude-only. Codex's `SubagentStop`-equivalent event has no
-`SubagentStopHookSpecificOutputWire` at all (confirmed by inspecting the
-compiled `codex` binary's schema via `strings`, 2026-09-03) -- it
-structurally cannot carry a block/retry decision the way Claude's can,
-so `--agent codex` is a genuine no-op here, not a fake/no-op parity
-shim.
+**Correction (2026-09-03, follow-up pass, see the evaluation doc's D4
+addendum):** an earlier pass claimed Codex's `SubagentStop`-equivalent
+event had no `SubagentStopHookSpecificOutputWire` at all, based on
+searching the compiled `codex` binary for the wrong string. Re-verified
+directly against the binary (0.153.2, linux-musl standalone): it embeds
+`subagent-stop.command.input`/`subagent-stop.command.output` JSON
+schemas (siblings to `subagent-start.*`), not wrapped in a
+`HookSpecificOutputWire` the way `PreToolUse`/`PostToolUse` are -- which
+is why the original search missed them. The output schema's fields are
+`decision` (a `BlockDecisionWire` enum, sole value `"block"`), `reason`
+(required by Codex's own parsing when `decision` is `block`), and
+`continue` (boolean, default `true`); the input schema requires
+`stop_hook_active` (boolean). A live probe (isolated `CODEX_HOME`,
+`codex exec --dangerously-bypass-hook-trust
+--dangerously-bypass-approvals-and-sandbox` against the real backend)
+confirmed the same top-level JSON shape as Claude's -- `{"decision":
+"block", "reason": ...}`, `stop_hook_active`, and `last_assistant_message`
+all present with matching names and semantics -- so this handler reuses
+the identical Claude branch's payload shape for Codex rather than a
+separate one.
+
+**Critical difference from Claude: Codex showed no evidence of a
+host-side retry cap** analogous to Claude's 8-block hard limit -- a
+probe run produced 207+ consecutive `SubagentStop` re-invocations with
+`stop_hook_active: true` and no natural termination before the run was
+manually killed. This module must never rely on a host-side cap for
+Codex. The `stop_hook_active` recursion guard below is therefore load
+bearing on Codex in a way it is merely a safety net for on Claude: it is
+the *only* thing preventing unbounded retries, so it is checked exactly
+the same way, unconditionally, before anything else, for both agents.
 
 Fails open (silent no-op) on any ACP error, missing/malformed field, or
 unexpected exception -- a stop must never be blocked on ambiguous input.
@@ -105,13 +129,21 @@ def handle_start() -> int:
 
 
 def handle_stop(agent: str, event: dict[str, Any]) -> int:
-    """Enforced bounded retry (C6), Claude-only -- see module docstring.
+    """Enforced bounded retry (C6), Claude and Codex -- see module docstring.
 
-    Fails open unconditionally: any exception, missing field, or wrong
-    type just falls through to `return 0` (no decision emitted, stop
-    proceeds normally).
+    Both hosts confirmed to use the identical top-level JSON shape
+    (`decision`/`reason`/`stop_hook_active`/`last_assistant_message`), so
+    one code path serves both -- no `agent`-specific branching needed
+    beyond accepting the value. Fails open unconditionally: any
+    exception, missing field, or wrong type just falls through to
+    `return 0` (no decision emitted, stop proceeds normally).
+
+    The `stop_hook_active` check is the ONLY guard against unbounded
+    retries on Codex (no confirmed host-side cap there, unlike Claude's
+    8-block limit) -- it must stay first and unconditional for both
+    agents.
     """
-    if agent != "claude":
+    if agent not in ("claude", "codex"):
         return 0
 
     try:
