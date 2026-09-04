@@ -55,6 +55,7 @@ _OUTCOME_STATUS = {
     "total_timeout": 504,
     "invalid_response": 502,
     "upstream_error": 502,
+    "maintenance": 503,
 }
 
 _DEFAULT_CAPABILITIES = [
@@ -62,6 +63,7 @@ _DEFAULT_CAPABILITIES = [
     "provider.status",
     "provider.concurrency",
     "request.timeout_outcomes",
+    "service.maintenance",
 ]
 
 

@@ -47,7 +47,7 @@ class CompressorTestCase(unittest.TestCase):
         self.addCleanup(self._tempdir.cleanup)
         self.client = AalpClient(aalp_root=self.root)
         self.telemetry = Telemetry()
-        self.compressor = Compressor(self.client, self.telemetry)
+        self.compressor = Compressor(self.client, self.telemetry, root=self.root)
 
     def _add_ci_provider(self, **overrides) -> None:
         defaults = dict(id="ci", display_name="ci", accepted_paths=["/v1/messages"])
@@ -72,6 +72,67 @@ class BypassTest(CompressorTestCase):
         )
         self.assertEqual(self.telemetry.get("compression_attempts"), 0)
         self.assertTrue(result.provenance.processed)
+
+
+class BypassModeTest(CompressorTestCase):
+    def test_bypass_flag_short_circuits_before_gate_or_any_aalp_call(self) -> None:
+        from acp import bypass
+
+        # No provider is even added -- if compress() reached gate.evaluate()
+        # and then AALP, a missing provider/programmed response would
+        # surface as a different outcome or a fixture LookupError, not
+        # MAINTENANCE.
+        bypass.enter_bypass(self.root)
+
+        result = self.compressor.compress(_BIG_PAYLOAD, TrafficClass.GENERAL)
+
+        self.assertIs(result.outcome, Outcome.MAINTENANCE)
+        self.assertEqual(result.mode, "PASS")
+        self.assertEqual(result.output, _BIG_PAYLOAD)
+        self.assertEqual(result.warnings, [])
+        self.assertTrue(result.provenance.processed)
+        self.assertEqual(self.telemetry.snapshot(), Telemetry().snapshot())
+
+    def test_flag_absent_serves_normally(self) -> None:
+        self._add_ci_provider()
+        result = self.compressor.compress(_SMALL_PAYLOAD, TrafficClass.GENERAL)
+
+        self.assertIs(result.outcome, Outcome.SUCCESS)
+
+    def test_exiting_bypass_resumes_normal_service(self) -> None:
+        from acp import bypass
+
+        self._add_ci_provider()
+        bypass.enter_bypass(self.root)
+        blocked = self.compressor.compress(_SMALL_PAYLOAD, TrafficClass.GENERAL)
+        self.assertIs(blocked.outcome, Outcome.MAINTENANCE)
+
+        bypass.exit_bypass(self.root)
+        resumed = self.compressor.compress(_SMALL_PAYLOAD, TrafficClass.GENERAL)
+        self.assertIs(resumed.outcome, Outcome.SUCCESS)
+
+
+class AalpMaintenancePassthroughTest(CompressorTestCase):
+    def test_maintenance_outcome_from_aalp_skips_telemetry_and_warnings(self) -> None:
+        self._add_ci_provider()
+        self.fake.program_response(
+            "ci", "/v1/messages", outcome="maintenance",
+            message="AALP is in maintenance mode",
+        )
+
+        result = self.compressor.compress(_BIG_PAYLOAD, TrafficClass.GENERAL)
+
+        self.assertIs(result.outcome, Outcome.MAINTENANCE)
+        self.assertEqual(result.mode, "PASS")
+        self.assertEqual(result.output, _BIG_PAYLOAD)
+        self.assertEqual(result.warnings, [])
+        self.assertTrue(result.provenance.processed)
+        # compression_attempts is incremented before the AALP call, since
+        # this path (unlike ACP's own bypass short-circuit) does reach
+        # AALP -- only the failure-side counters/warnings are skipped.
+        self.assertEqual(self.telemetry.get("compression_attempts"), 1)
+        self.assertEqual(self.telemetry.get("compression_availability"), 0)
+        self.assertEqual(self.telemetry.get("compression_timeout_bypass_tokens"), 0)
 
 
 class SuccessParsingTest(CompressorTestCase):

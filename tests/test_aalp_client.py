@@ -29,7 +29,8 @@ class CapabilitiesTest(AalpClientTestCase):
         self.assertEqual(caps["interface_version"], 1)
         self.assertEqual(
             set(caps["capabilities"]),
-            {"request.forward", "provider.status", "provider.concurrency", "request.timeout_outcomes"},
+            {"request.forward", "provider.status", "provider.concurrency",
+             "request.timeout_outcomes", "service.maintenance"},
         )
 
     def test_capability_list_is_configurable(self) -> None:
@@ -109,6 +110,9 @@ class ForwardNonSuccessOutcomeTest(AalpClientTestCase):
 
     def test_upstream_error(self) -> None:
         self._assert_outcome("upstream_error", 502)
+
+    def test_maintenance(self) -> None:
+        self._assert_outcome("maintenance", 503)
 
     def test_unavailable_for_unknown_provider_without_programming(self) -> None:
         # no add_provider() call at all -> AALP-side "unavailable", not a
