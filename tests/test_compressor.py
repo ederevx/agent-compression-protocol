@@ -7,6 +7,7 @@ import json as _json
 
 from acp.aalp_client import AalpClient
 from acp.compressor import (
+    RESPONSE_CODEC_JSON_ARRAY,
     Compressor,
     _build_request_body,
     _compute_max_tokens,
@@ -31,6 +32,25 @@ def _compressor_body(
     content_text = f"ACP-QUEUE-ITEM: {member_id}\nACP-MODE: {mode}"
     if text or mode != "PASS":
         content_text += "\n\n" + text
+    obj: dict = {"content": [{"type": "text", "text": content_text}]}
+    if usage is not None:
+        obj["usage"] = usage
+    if stop_reason is not None:
+        obj["stop_reason"] = stop_reason
+    return json.dumps(obj).encode("utf-8")
+
+
+def _compressor_body_json_array(
+    mode: str, text: str = "", usage: dict | None = None, stop_reason: str | None = None,
+    member_id: str = MEMBER_ID_TOKEN,
+) -> bytes:
+    """Same shape as `_compressor_body`, but for the JSON-array response
+    codec (`acp.queue_codec_json.parse_queue_member_result_json_array`).
+    Request-side member framing is unchanged either way, so
+    `FakeAalpV1._extract_member_id` still finds the real member id from
+    the textual `ACP-QUEUE-ITEM:` line in the request and substitutes it
+    for `member_id` here, exactly as it does for the textual codec."""
+    content_text = json.dumps([{"id": member_id, "mode": mode, "output": text}])
     obj: dict = {"content": [{"type": "text", "text": content_text}]}
     if usage is not None:
         obj["usage"] = usage
@@ -639,6 +659,84 @@ class CompressorThinkingBudgetWiringTest(CompressorTestCase):
         self.assertEqual(
             sent_body["shared"]["thinking"], {"type": "enabled", "budget_tokens": 1024}
         )
+
+
+class ResponseCodecJsonArrayTest(CompressorTestCase):
+    """Proves `Compressor(response_codec=RESPONSE_CODEC_JSON_ARRAY)` isn't
+    just inert wiring: the outbound request actually carries the JSON-
+    array addendum and `response_format`, and a JSON-array-shaped
+    response actually parses -- the same end-to-end shape
+    `CompressorThinkingBudgetWiringTest` uses for the textual codec's own
+    wiring, exercised here for the codec-selection path the live
+    comparison depends on."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.compressor = Compressor(
+            self.client, self.telemetry, root=self.root,
+            response_codec=RESPONSE_CODEC_JSON_ARRAY,
+        )
+
+    def test_outbound_request_carries_json_array_addendum_and_schema(self) -> None:
+        self._add_ci_provider()
+        self.fake.program_response(
+            "ci", "/v1/messages", outcome="success",
+            body=_compressor_body_json_array("COMPACT", "shrunk"),
+        )
+        self.compressor.compress(_BIG_PAYLOAD, TrafficClass.GENERAL)
+
+        sent_body = _json.loads(self.fake.last_body)
+        self.assertIn(
+            "experimental ACP-QUEUE/1-JSON variant", sent_body["shared"]["system"])
+        self.assertEqual(
+            sent_body["shared"]["response_format"]["type"], "json_schema")
+
+    def test_json_array_response_round_trips_to_compact_output(self) -> None:
+        self._add_ci_provider()
+        self.fake.program_response(
+            "ci", "/v1/messages", outcome="success",
+            body=_compressor_body_json_array("COMPACT", "shrunk-output"),
+        )
+        result = self.compressor.compress(_BIG_PAYLOAD, TrafficClass.GENERAL)
+
+        self.assertIs(result.outcome, Outcome.SUCCESS)
+        self.assertEqual(result.mode, "COMPACT")
+        self.assertEqual(result.output, "shrunk-output")
+
+    def test_pass_mode_substitutes_original_payload(self) -> None:
+        self._add_ci_provider()
+        self.fake.program_response(
+            "ci", "/v1/messages", outcome="success",
+            body=_compressor_body_json_array("PASS", ""),
+        )
+        result = self.compressor.compress(_BIG_PAYLOAD, TrafficClass.GENERAL)
+
+        self.assertIs(result.outcome, Outcome.SUCCESS)
+        self.assertEqual(result.mode, "PASS")
+        self.assertEqual(result.output, _BIG_PAYLOAD)
+
+    def test_duplicate_id_in_response_is_invalid_response(self) -> None:
+        self._add_ci_provider()
+        body = json.dumps({
+            "content": [{
+                "type": "text",
+                "text": json.dumps([
+                    {"id": MEMBER_ID_TOKEN, "mode": "COMPACT", "output": "a"},
+                    {"id": MEMBER_ID_TOKEN, "mode": "COMPACT", "output": "b"},
+                ]),
+            }],
+        }).encode("utf-8")
+        self.fake.program_response("ci", "/v1/messages", outcome="success", body=body)
+
+        result = self.compressor.compress(_BIG_PAYLOAD, TrafficClass.GENERAL)
+
+        self.assertIs(result.outcome, Outcome.INVALID_RESPONSE)
+
+
+class ResponseCodecDefaultTest(CompressorTestCase):
+    def test_unknown_response_codec_rejected_at_construction(self) -> None:
+        with self.assertRaises(ValueError):
+            Compressor(self.client, self.telemetry, response_codec="not-a-real-codec")
 
 
 if __name__ == "__main__":

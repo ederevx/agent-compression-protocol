@@ -48,6 +48,7 @@ from acp import bypass
 from acp import gate
 from acp import provenance as provenance_mod
 from acp import queue_codec
+from acp import queue_codec_json
 from acp.aalp_client import AalpClient
 from acp.errors import AcpResult, Outcome, TrafficClass
 from acp.gate import GateAction, TrafficClassThresholds
@@ -55,6 +56,18 @@ from acp.provenance import Provenance
 from acp.queue_codec import QueueMemberRequest, QueueProtocolViolation
 from acp.telemetry import Telemetry
 from acp.warnings import CompressionWarningTracker
+
+# Selects which response grammar the compressor model is asked to use
+# and how ACP parses its own member's result back out -- request-side
+# member framing (build_member_block/build_queue_envelope) is identical
+# either way (see acp/queue_codec_json.py's module docstring). Exists
+# purely to let a live comparison exercise both the shipped textual
+# ACP-QUEUE/1 grammar and the JSON-array design that experiment
+# recommended, side by side against the same real backend; not a
+# durable public surface, so no config file/env var reads it.
+RESPONSE_CODEC_TEXTUAL = "textual"
+RESPONSE_CODEC_JSON_ARRAY = "json_array"
+_RESPONSE_CODECS = (RESPONSE_CODEC_TEXTUAL, RESPONSE_CODEC_JSON_ARRAY)
 
 # The `ci` provider's real, currently-only-available model as confirmed
 # by a live agent_protocols_v1 Phase 3 activation test against the real
@@ -282,12 +295,17 @@ def _build_request_body(
     max_tokens: int,
     member_id: str,
     thinking_budget_tokens: int | None = None,
+    response_codec: str = RESPONSE_CODEC_TEXTUAL,
 ) -> bytes:
     """Build this call's self-describing queue envelope (§10-§12) -- not
     a fully-built physical request body. `shared` is the physical
     request skeleton with `_CONTENT_SENTINEL` standing in for wherever
     AALP will later deep-set the assembled member train (possibly
-    including other members this call has no visibility into, §9)."""
+    including other members this call has no visibility into, §9).
+
+    `response_codec` picks which response grammar the compressor model
+    is told to use (see `RESPONSE_CODEC_*` above); it never affects the
+    request-side member framing itself."""
     if thinking_budget_tokens is not None:
         max_tokens = max(
             max_tokens, thinking_budget_tokens + _MIN_OUTPUT_HEADROOM_ABOVE_THINKING
@@ -295,12 +313,21 @@ def _build_request_body(
     user_message = _build_user_message(
         payload, traffic_class, reduction_hint, target_tokens, max_tokens
     )
+    if response_codec == RESPONSE_CODEC_JSON_ARRAY:
+        system_prompt = (
+            COMPRESSOR_SYSTEM_PROMPT.rstrip() + "\n\n"
+            + queue_codec_json.QUEUE_JSON_SKELETON_REF_ARRAY_ADDENDUM + "\n"
+        )
+    else:
+        system_prompt = queue_codec.build_system_prompt(COMPRESSOR_SYSTEM_PROMPT)
     shared: dict[str, Any] = {
         "model": model,
         "max_tokens": max_tokens,
-        "system": queue_codec.build_system_prompt(COMPRESSOR_SYSTEM_PROMPT),
+        "system": system_prompt,
         "messages": [{"role": "user", "content": _CONTENT_SENTINEL}],
     }
+    if response_codec == RESPONSE_CODEC_JSON_ARRAY:
+        shared["response_format"] = queue_codec_json.build_queue_response_format()
     if thinking_budget_tokens is not None:
         shared["thinking"] = {
             "type": "enabled",
@@ -311,7 +338,7 @@ def _build_request_body(
 
 
 def _parse_compressor_response(
-    body: bytes, member_id: str
+    body: bytes, member_id: str, response_codec: str = RESPONSE_CODEC_TEXTUAL,
 ) -> tuple[str, str, dict[str, Any] | None]:
     """Parse one Anthropic-Messages-shaped compressor response and
     extract just `member_id`'s own result, ignoring any other members
@@ -347,7 +374,11 @@ def _parse_compressor_response(
         ) from exc
 
     try:
-        result = queue_codec.parse_queue_member_result(text, member_id)
+        if response_codec == RESPONSE_CODEC_JSON_ARRAY:
+            result = queue_codec_json.parse_queue_member_result_json_array(
+                text, member_id)
+        else:
+            result = queue_codec.parse_queue_member_result(text, member_id)
     except QueueProtocolViolation as violation:
         raise CompressorProtocolViolation(str(violation)) from violation
 
@@ -401,7 +432,10 @@ class Compressor:
         total_timeout: float = DEFAULT_TOTAL_TIMEOUT_SECONDS,
         thresholds: dict[TrafficClass, TrafficClassThresholds] | None = None,
         root: str | Path | None = None,
+        response_codec: str = RESPONSE_CODEC_TEXTUAL,
     ) -> None:
+        if response_codec not in _RESPONSE_CODECS:
+            raise ValueError(f"unknown response_codec {response_codec!r}")
         self._aalp_client = aalp_client
         self._telemetry = telemetry
         self._provider_id = provider_id
@@ -412,6 +446,7 @@ class Compressor:
         self._total_timeout = total_timeout
         self._thresholds = thresholds
         self._root = root
+        self._response_codec = response_codec
         self._warnings = CompressionWarningTracker()
 
     @property
@@ -472,6 +507,7 @@ class Compressor:
         body = _build_request_body(
             payload, traffic_class, decision.reduction_hint, self._model,
             target_tokens, max_tokens, member_id, self._thinking_budget_tokens,
+            response_codec=self._response_codec,
         )
 
         # request.queue rather than request.forward (§13's "queue-of-one
@@ -518,7 +554,7 @@ class Compressor:
         if outcome is Outcome.SUCCESS:
             try:
                 parsed_mode, parsed_output, usage = _parse_compressor_response(
-                    queue_result.body, member_id
+                    queue_result.body, member_id, self._response_codec
                 )
             except CompressorProtocolViolation as violation:
                 outcome = Outcome.INVALID_RESPONSE
