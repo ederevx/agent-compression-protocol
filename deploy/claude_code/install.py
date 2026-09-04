@@ -159,6 +159,9 @@ def install(dry_run: bool, with_parent_child_context: bool) -> int:
     hook_specs = [
         ("SubagentStart", _SUBAGENT_REPORT_MODULE, "SubagentStart", dict(
             status_message="ACP: offer the report tool for a large final report", timeout=5)),
+        ("SubagentStop", _SUBAGENT_REPORT_MODULE, "SubagentStop", dict(
+            status_message="ACP: enforce report-tool use for oversized subagent output",
+            timeout=5)),
     ]
     if with_parent_child_context:
         hook_specs.append(("PreToolUse/Task", _PARENT_CHILD_CONTEXT_MODULE, "PreToolUse", dict(
