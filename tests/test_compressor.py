@@ -25,9 +25,10 @@ _SMALL_PAYLOAD = "tiny payload"
 
 
 def _compressor_body(
-    mode: str, text: str = "", usage: dict | None = None, stop_reason: str | None = None
+    mode: str, text: str = "", usage: dict | None = None, stop_reason: str | None = None,
+    member_id: str = "solo",
 ) -> bytes:
-    content_text = f"ACP-MODE: {mode}"
+    content_text = f"ACP-QUEUE-ITEM: {member_id}\nACP-MODE: {mode}"
     if text or mode != "PASS":
         content_text += "\n\n" + text
     obj: dict = {"content": [{"type": "text", "text": content_text}]}
@@ -121,7 +122,7 @@ class SuccessParsingTest(CompressorTestCase):
             "content": [
                 {"type": "text", "text": ""},
                 {"type": "thinking", "thinking": "reasoning...", "signature": ""},
-                {"type": "text", "text": "ACP-MODE: COMPACT\n\ncompacted via thinking"},
+                {"type": "text", "text": "ACP-QUEUE-ITEM: solo\nACP-MODE: COMPACT\n\ncompacted via thinking"},
             ],
             "usage": {"input_tokens": 9000, "output_tokens": 50},
         }

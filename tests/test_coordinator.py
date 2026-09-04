@@ -19,7 +19,7 @@ _RECEIVER = ("test-host", "session-1", None)
 
 
 def _compressor_body(mode: str, text: str = "", usage: dict | None = None) -> bytes:
-    content_text = f"ACP-MODE: {mode}"
+    content_text = f"ACP-QUEUE-ITEM: solo\nACP-MODE: {mode}"
     if text or mode != "PASS":
         content_text += "\n\n" + text
     obj: dict = {"content": [{"type": "text", "text": content_text}]}

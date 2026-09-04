@@ -44,7 +44,7 @@ _COMPRESSED_CAPSULE = "3 build failures in foo.c; root cause: bar() null deref"
 
 
 def _compressor_body(mode: str, text: str) -> bytes:
-    obj = {"content": [{"type": "text", "text": f"ACP-MODE: {mode}\n\n{text}"}]}
+    obj = {"content": [{"type": "text", "text": f"ACP-QUEUE-ITEM: solo\nACP-MODE: {mode}\n\n{text}"}]}
     return json.dumps(obj).encode("utf-8")
 
 

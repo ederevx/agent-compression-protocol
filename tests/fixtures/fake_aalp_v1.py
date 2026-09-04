@@ -62,6 +62,7 @@ _DEFAULT_CAPABILITIES = [
     "provider.status",
     "provider.concurrency",
     "request.timeout_outcomes",
+    "request.queue",
 ]
 
 
@@ -289,6 +290,16 @@ class FakeAalpV1:
         headers = {"X-Aalp-Outcome": outcome, "Content-Type": "application/json"}
         return status if status is not None else _OUTCOME_STATUS[outcome], headers, body
 
+    def handle_queue(self, provider_id: str, path: str) -> tuple[int, dict[str, str], bytes]:
+        """`request.queue`, Stage 1 (singleton) scope: identical to
+        `handle_forward()` plus the two generation-metadata headers --
+        mirrors AALP's own real `Gateway.handle_queue()`."""
+        status, headers, body = self.handle_forward(provider_id, path)
+        headers = dict(headers)
+        headers["X-Aalp-Queue-Generation-Id"] = secrets.token_hex(8)
+        headers["X-Aalp-Queue-Member-Count"] = "1"
+        return status, headers, body
+
     # -- socket server --------------------------------------------------------
 
     def _serve_forever(self) -> None:
@@ -381,4 +392,6 @@ class FakeAalpV1:
         segment, _, rest = path.lstrip("/").partition("/")
         upstream_path = "/" + rest if rest else ""
         self.last_headers = headers
+        if headers.get("X-Aalp-Queue-Key") is not None:
+            return self.handle_queue(segment, upstream_path)
         return self.handle_forward(segment, upstream_path)

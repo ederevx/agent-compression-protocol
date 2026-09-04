@@ -19,7 +19,7 @@ _BIG_PAYLOAD = "log line filler content " * 1600
 
 
 def _compressor_body(mode: str, text: str = "") -> bytes:
-    content_text = f"ACP-MODE: {mode}"
+    content_text = f"ACP-QUEUE-ITEM: solo\nACP-MODE: {mode}"
     if text or mode != "PASS":
         content_text += "\n\n" + text
     return json.dumps({"content": [{"type": "text", "text": content_text}]}).encode("utf-8")
