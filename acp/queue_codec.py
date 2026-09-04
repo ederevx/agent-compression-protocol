@@ -11,12 +11,16 @@ layers, three independent modules -- matching how the adjustment itself
 separates AALP's opaque queue_key (§9) from ACP's queue grammar (§15)
 from the physical Messages request (§17).
 
-Stage 2 scope: `acp/compressor.py` migrates onto this grammar for
-`member_count == 1` first (the adjustment's own §31 migration gate).
-`build_member_train`/`parse_queue_response` are already list-of-members
-APIs, not a singleton-only shortcut -- Stage 3's real accumulation grows
-the caller (AALP's mechanical train assembly, §11), not this module's
-shape.
+Stage 3 scope: real multi-member accumulation happens entirely on AALP's
+side (`aalp/queue.py`'s `build_physical_body`, mechanically joining each
+member's own framed block) -- ACP itself only ever builds *its own*
+single member's block and envelope (`build_member_block`/
+`build_queue_envelope`), and only ever parses *its own* member's result
+back out of a response that may also contain other, unknown-to-it
+members' blocks (`parse_queue_member_result`). No caller here ever has
+visibility into who else it was coalesced with (§9) -- that asymmetry
+(build one block, parse a response that might hold several) is the
+central Stage 3 change from Stage 2's build/parse-the-whole-train shape.
 
 Concrete wire format (this pass's own choice; the adjustment doc leaves
 the exact per-item framing unspecified, only its conceptual ordering --
@@ -25,9 +29,12 @@ the exact per-item framing unspecified, only its conceptual ordering --
     ACP-QUEUE-ITEM: <opaque member id>
     <member content, built by the caller>
 
-in submission order, followed by a trailing:
+AALP mechanically joins members in FIFO order and appends a trailing:
 
     ACP-QUEUE-MEMBER-COUNT: <n>
+
+to the physical request (§11/§12) -- ACP never builds that trailer
+itself, since it never knows the final count until AALP assembles it.
 
 The compressor's response must mirror the same per-item framing:
 
@@ -36,10 +43,11 @@ The compressor's response must mirror the same per-item framing:
 
     <transformed content, or nothing for PASS>
 
-`parse_queue_response` enforces §14's declared-count/id-set invariant
-(no missing, duplicated, or invented item ids) and raises
-`QueueProtocolViolation` on any violation -- per §19, a caller must treat
-that as a whole-generation failure, never a partial one.
+`parse_queue_member_result` enforces §14's per-member invariant (exactly
+one block for the caller's own member id, never zero or duplicated) and
+raises `QueueProtocolViolation` on any violation -- per §19, a caller
+must treat a structurally malformed response (no item blocks at all) as
+a whole-generation failure, never a partial one.
 
 Known limitation, deferred to Stage 5's adversarial fixtures (§30): this
 is a textual delimiter format, so payload content that itself contains a
@@ -50,10 +58,19 @@ contamination testing pass.
 """
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
+from typing import Any
 
 QUEUE_PROTOCOL_NAME = "ACP-QUEUE/1"
+
+# §11/§12: what AALP's `aalp.queue.QueueGeneration.build_physical_body()`
+# joins members with, and the trailer template it appends after them --
+# fixed constants shared by every caller of `build_queue_envelope`, since
+# AALP compares nothing about them beyond using them mechanically.
+_MEMBER_JOIN = "\n\n"
+_COUNT_TEMPLATE = "ACP-QUEUE-MEMBER-COUNT: {member_count}"
 
 _ITEM_HEADER_RE = re.compile(r"^ACP-QUEUE-ITEM: (?P<id>.+)$", re.MULTILINE)
 
@@ -108,64 +125,77 @@ def build_system_prompt(base_prompt: str) -> str:
     return base_prompt.rstrip() + "\n\n" + QUEUE_ISOLATION_ADDENDUM + "\n"
 
 
-def build_member_train(members: list[QueueMemberRequest]) -> str:
-    """§11/§14: the volatile member-train-plus-count suffix. Identical
-    shape for one member (§13's "queue-of-one uses the identical
-    grammar") or several -- only `len(members)` changes."""
-    if not members:
-        raise ValueError("build_member_train requires at least one member")
-    blocks = [
-        f"ACP-QUEUE-ITEM: {member.member_id}\n{member.content}"
-        for member in members
-    ]
-    blocks.append(f"ACP-QUEUE-MEMBER-COUNT: {len(members)}")
-    return "\n\n".join(blocks)
+def build_member_block(member: QueueMemberRequest) -> str:
+    """One member's own framed text (§11) -- the piece AALP mechanically
+    joins with every other coalesced member's block to build the shared
+    physical request body. A caller only ever builds its own block; it
+    never has visibility into who else it might be coalesced with (§9),
+    so unlike Stage 2's `build_member_train` this cannot build the full
+    train or the trailing count -- AALP owns both, since only AALP knows
+    the final membership."""
+    return f"ACP-QUEUE-ITEM: {member.member_id}\n{member.content}"
 
 
-def parse_queue_response(
-    text: str, expected_member_ids: list[str]
-) -> list[QueueMemberResult]:
-    """Parse a queue-grammar response text and enforce §14's
-    declared-count/id-set invariant against `expected_member_ids`
-    (the ids ACP itself submitted, in submission order -- duplicates in
-    this list would be a caller bug, not a response defect).
+def build_queue_envelope(
+    shared: dict[str, Any], content_path: list, member: QueueMemberRequest
+) -> bytes:
+    """The self-describing JSON envelope `AalpClient.submit_queue_member`'s
+    `body` now carries (§10-§12): `shared` is the full physical request
+    skeleton (already containing a placeholder value at `content_path`,
+    which AALP overwrites with the assembled member train once admission
+    happens) -- AALP never interprets `shared` beyond that one path, so
+    any Messages-API-shaped dict works here unchanged. `content_path` is
+    a list of dict keys / list indices identifying where inside `shared`
+    the member train belongs (e.g. `["messages", 0, "content"]`)."""
+    envelope = {
+        "shared": shared,
+        "content_path": list(content_path),
+        "member_block": build_member_block(member),
+        "member_join": _MEMBER_JOIN,
+        "count_template": _COUNT_TEMPLATE,
+    }
+    return json.dumps(envelope).encode("utf-8")
 
-    Raises `QueueProtocolViolation` if: no item blocks are found; an
-    item block is missing a valid `ACP-MODE` line; the response's item
-    ids (as a set) don't exactly match `expected_member_ids` (as a set);
-    or the response declares any duplicate item id.
+
+def parse_queue_member_result(text: str, member_id: str) -> QueueMemberResult:
+    """Parse a queue-grammar response and extract just `member_id`'s own
+    block, ignoring any other members that may have been coalesced into
+    the same physical response alongside it -- a caller only ever knows
+    its own member id, never the full membership of the generation it
+    landed in (§9).
+
+    Raises `QueueProtocolViolation` if: no item blocks are found at all
+    (§19 -- a structurally malformed physical response is a shared,
+    whole-generation failure, not specific to any one member); `member_id`
+    does not appear in the response, or appears more than once; or its
+    block is missing a valid `ACP-MODE` line.
     """
     matches = list(_ITEM_HEADER_RE.finditer(text))
     if not matches:
         raise QueueProtocolViolation("no ACP-QUEUE-ITEM blocks found in response")
 
-    results: list[QueueMemberResult] = []
+    own_blocks: list[str] = []
     for index, match in enumerate(matches):
-        member_id = match.group("id").strip()
+        if match.group("id").strip() != member_id:
+            continue
         block_start = match.end()
         block_end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
-        block = text[block_start:block_end].lstrip("\n")
+        own_blocks.append(text[block_start:block_end].lstrip("\n"))
 
-        first_line, _, remainder = block.partition("\n")
-        mode = _MODE_LINES.get(first_line.strip())
-        if mode is None:
-            raise QueueProtocolViolation(
-                f"item {member_id!r}: missing or invalid ACP-MODE line, "
-                f"got {first_line.strip()!r}"
-            )
-        if remainder.startswith("\n"):
-            remainder = remainder[1:]
-        results.append(
-            QueueMemberResult(member_id=member_id, mode=mode, output=remainder.rstrip("\n"))
-        )
-
-    returned_ids = [result.member_id for result in results]
-    if len(returned_ids) != len(set(returned_ids)):
-        raise QueueProtocolViolation(f"duplicate item ids in response: {returned_ids}")
-    if set(returned_ids) != set(expected_member_ids):
+    if not own_blocks:
         raise QueueProtocolViolation(
-            f"response item ids {sorted(set(returned_ids))} do not match "
-            f"submitted item ids {sorted(set(expected_member_ids))}"
-        )
+            f"no ACP-QUEUE-ITEM block found for member id {member_id!r}")
+    if len(own_blocks) > 1:
+        raise QueueProtocolViolation(
+            f"duplicate ACP-QUEUE-ITEM blocks for member id {member_id!r}")
 
-    return results
+    first_line, _, remainder = own_blocks[0].partition("\n")
+    mode = _MODE_LINES.get(first_line.strip())
+    if mode is None:
+        raise QueueProtocolViolation(
+            f"item {member_id!r}: missing or invalid ACP-MODE line, "
+            f"got {first_line.strip()!r}"
+        )
+    if remainder.startswith("\n"):
+        remainder = remainder[1:]
+    return QueueMemberResult(member_id=member_id, mode=mode, output=remainder.rstrip("\n"))

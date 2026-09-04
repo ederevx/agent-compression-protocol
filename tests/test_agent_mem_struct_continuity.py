@@ -33,7 +33,7 @@ from acp.aalp_client import AalpClient
 from acp.compressor import Compressor
 from acp.errors import TrafficClass
 from acp.telemetry import Telemetry
-from tests.fixtures.fake_aalp_v1 import FakeAalpV1, FakeProvider
+from tests.fixtures.fake_aalp_v1 import MEMBER_ID_TOKEN, FakeAalpV1, FakeProvider
 
 _MEM_STRUCT_HOOK = Path("/home/ederevx/agent-mem-struct/hooks/root-memory-context.py")
 
@@ -44,7 +44,7 @@ _COMPRESSED_CAPSULE = "3 build failures in foo.c; root cause: bar() null deref"
 
 
 def _compressor_body(mode: str, text: str) -> bytes:
-    obj = {"content": [{"type": "text", "text": f"ACP-QUEUE-ITEM: solo\nACP-MODE: {mode}\n\n{text}"}]}
+    obj = {"content": [{"type": "text", "text": f"ACP-QUEUE-ITEM: {MEMBER_ID_TOKEN}\nACP-MODE: {mode}\n\n{text}"}]}
     return json.dumps(obj).encode("utf-8")
 
 

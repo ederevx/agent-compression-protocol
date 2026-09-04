@@ -15,7 +15,7 @@ from acp.compressor import (
 from acp.errors import Outcome, TrafficClass
 from acp.provenance import compute_hash
 from acp.telemetry import Telemetry
-from tests.fixtures.fake_aalp_v1 import FakeAalpV1, FakeProvider
+from tests.fixtures.fake_aalp_v1 import MEMBER_ID_TOKEN, FakeAalpV1, FakeProvider
 
 # > 32000 chars -> > 8000 estimated tokens (len // 4) -> GENERAL traffic
 # class INSPECT, not BYPASS (bypass_max=8000).
@@ -26,7 +26,7 @@ _SMALL_PAYLOAD = "tiny payload"
 
 def _compressor_body(
     mode: str, text: str = "", usage: dict | None = None, stop_reason: str | None = None,
-    member_id: str = "solo",
+    member_id: str = MEMBER_ID_TOKEN,
 ) -> bytes:
     content_text = f"ACP-QUEUE-ITEM: {member_id}\nACP-MODE: {mode}"
     if text or mode != "PASS":
@@ -122,7 +122,7 @@ class SuccessParsingTest(CompressorTestCase):
             "content": [
                 {"type": "text", "text": ""},
                 {"type": "thinking", "thinking": "reasoning...", "signature": ""},
-                {"type": "text", "text": "ACP-QUEUE-ITEM: solo\nACP-MODE: COMPACT\n\ncompacted via thinking"},
+                {"type": "text", "text": f"ACP-QUEUE-ITEM: {MEMBER_ID_TOKEN}\nACP-MODE: COMPACT\n\ncompacted via thinking"},
             ],
             "usage": {"input_tokens": 9000, "output_tokens": 50},
         }
@@ -173,7 +173,7 @@ class MaxTokensCapExcludesWrapperTest(CompressorTestCase):
             "ci", "/v1/messages", outcome="success", body=_compressor_body("COMPACT", "ok"),
         )
         self.compressor.compress(_BIG_PAYLOAD, TrafficClass.GENERAL)
-        general_max_tokens = _json.loads(self.fake.last_body)["max_tokens"]
+        general_max_tokens = _json.loads(self.fake.last_body)["shared"]["max_tokens"]
 
         # NATIVE_AGENT_REPORT, not DOWNWARD_CONTEXT: DOWNWARD_CONTEXT's
         # bypass_max (12,000) exceeds _BIG_PAYLOAD's ~10,000 estimated
@@ -184,7 +184,7 @@ class MaxTokensCapExcludesWrapperTest(CompressorTestCase):
             "ci", "/v1/messages", outcome="success", body=_compressor_body("COMPACT", "ok"),
         )
         self.compressor.compress(_BIG_PAYLOAD, TrafficClass.NATIVE_AGENT_REPORT)
-        other_max_tokens = _json.loads(self.fake.last_body)["max_tokens"]
+        other_max_tokens = _json.loads(self.fake.last_body)["shared"]["max_tokens"]
 
         self.assertEqual(general_max_tokens, other_max_tokens)
 
@@ -197,18 +197,18 @@ class OutputOnlyCompressedContentPromptTest(unittest.TestCase):
 
     def test_system_prompt_forbids_commentary_and_meta_discussion(self) -> None:
         body = _json.loads(
-            _build_request_body("payload", TrafficClass.GENERAL, None, "m", 256, 512)
+            _build_request_body("payload", TrafficClass.GENERAL, None, "m", 256, 512, "test-member")
         )
-        system = body["system"]
+        system = body["shared"]["system"]
         self.assertIn("STRICTLY AND ONLY", system)
         self.assertIn("Do not include commentary", system)
         self.assertIn("meta-discussion", system)
 
     def test_user_message_reinforces_output_only_the_compressed_content(self) -> None:
         body = _json.loads(
-            _build_request_body("payload", TrafficClass.GENERAL, None, "m", 256, 512)
+            _build_request_body("payload", TrafficClass.GENERAL, None, "m", 256, 512, "test-member")
         )
-        content = body["messages"][0]["content"]
+        content = body["member_block"]
         self.assertIn("nothing but the compressed content itself", content)
 
 
@@ -220,18 +220,18 @@ class CompressAsMuchAsPossiblePromptTest(unittest.TestCase):
 
     def test_system_prompt_frames_budget_as_maximum_not_goal(self) -> None:
         body = _json.loads(
-            _build_request_body("payload", TrafficClass.GENERAL, None, "m", 256, 512)
+            _build_request_body("payload", TrafficClass.GENERAL, None, "m", 256, 512, "test-member")
         )
-        system = body["system"]
+        system = body["shared"]["system"]
         self.assertIn("smallest output", system)
         self.assertIn("not approaching, filling, or matching", system)
         self.assertIn("Neither number is a goal", system)
 
     def test_user_message_frames_ceiling_as_maximum_not_goal(self) -> None:
         body = _json.loads(
-            _build_request_body("payload", TrafficClass.GENERAL, None, "m", 256, 512)
+            _build_request_body("payload", TrafficClass.GENERAL, None, "m", 256, 512, "test-member")
         )
-        content = body["messages"][0]["content"]
+        content = body["member_block"]
         self.assertIn("NOT a target to reach", content)
         self.assertIn("smallest output", content)
 
@@ -302,8 +302,8 @@ class MaxTokensCapWiringTest(CompressorTestCase):
         sent_body = _json.loads(self.fake.last_body)
         estimated_input_tokens = len(_BIG_PAYLOAD) // 4
         expected = estimated_input_tokens // 2 + round(estimated_input_tokens * 0.05)
-        self.assertEqual(sent_body["max_tokens"], expected)
-        self.assertLessEqual(sent_body["max_tokens"], round(estimated_input_tokens * 0.55))
+        self.assertEqual(sent_body["shared"]["max_tokens"], expected)
+        self.assertLessEqual(sent_body["shared"]["max_tokens"], round(estimated_input_tokens * 0.55))
 
     def test_outbound_message_states_the_strict_fifty_percent_ceiling(self) -> None:
         self._add_ci_provider()
@@ -314,7 +314,7 @@ class MaxTokensCapWiringTest(CompressorTestCase):
         self.compressor.compress(_BIG_PAYLOAD, TrafficClass.GENERAL)
         sent_body = _json.loads(self.fake.last_body)
         estimated_input_tokens = len(_BIG_PAYLOAD) // 4
-        content = sent_body["messages"][0]["content"]
+        content = sent_body["member_block"]
         self.assertIn(f"Reduction ceiling: {estimated_input_tokens // 2} tokens", content)
         self.assertIn("NOT a target to reach", content)
 
@@ -489,9 +489,9 @@ class OutputBudgetPromptTest(unittest.TestCase):
 
     def test_outbound_message_states_the_actual_max_tokens_budget(self) -> None:
         body = _json.loads(
-            _build_request_body("payload", TrafficClass.GENERAL, None, "m", 300, 777)
+            _build_request_body("payload", TrafficClass.GENERAL, None, "m", 300, 777, "test-member")
         )
-        content = body["messages"][0]["content"]
+        content = body["member_block"]
         self.assertIn("777", content)
 
     def test_budget_stated_reflects_thinking_adjusted_max_tokens(self) -> None:
@@ -501,12 +501,12 @@ class OutputBudgetPromptTest(unittest.TestCase):
         # actually-enforced value, not the pre-adjustment one.
         body = _json.loads(
             _build_request_body(
-                "payload", TrafficClass.GENERAL, None, "m", 256, 512,
+                "payload", TrafficClass.GENERAL, None, "m", 256, 512, "test-member",
                 thinking_budget_tokens=1024,
             )
         )
-        content = body["messages"][0]["content"]
-        self.assertIn(str(body["max_tokens"]), content)
+        content = body["member_block"]
+        self.assertIn(str(body["shared"]["max_tokens"]), content)
         self.assertNotIn("512", content)
 
 
@@ -518,19 +518,19 @@ class ThinkingBudgetRequestBodyTest(unittest.TestCase):
 
     def test_default_omits_thinking_field(self) -> None:
         body = _json.loads(
-            _build_request_body("payload", TrafficClass.GENERAL, None, "m", 256, 512)
+            _build_request_body("payload", TrafficClass.GENERAL, None, "m", 256, 512, "test-member")
         )
-        self.assertNotIn("thinking", body)
+        self.assertNotIn("thinking", body["shared"])
 
     def test_explicit_budget_adds_thinking_field(self) -> None:
         body = _json.loads(
             _build_request_body(
-                "payload", TrafficClass.GENERAL, None, "m", 256, 512,
+                "payload", TrafficClass.GENERAL, None, "m", 256, 512, "test-member",
                 thinking_budget_tokens=1024,
             )
         )
         self.assertEqual(
-            body["thinking"], {"type": "enabled", "budget_tokens": 1024}
+            body["shared"]["thinking"], {"type": "enabled", "budget_tokens": 1024}
         )
 
     def test_max_tokens_raised_above_thinking_budget_when_needed(self) -> None:
@@ -539,20 +539,20 @@ class ThinkingBudgetRequestBodyTest(unittest.TestCase):
         # so _build_request_body must raise it, not send an invalid body.
         body = _json.loads(
             _build_request_body(
-                "payload", TrafficClass.GENERAL, None, "m", 256, 512,
+                "payload", TrafficClass.GENERAL, None, "m", 256, 512, "test-member",
                 thinking_budget_tokens=1024,
             )
         )
-        self.assertGreater(body["max_tokens"], 1024)
+        self.assertGreater(body["shared"]["max_tokens"], 1024)
 
     def test_max_tokens_left_alone_when_already_sufficient(self) -> None:
         body = _json.loads(
             _build_request_body(
-                "payload", TrafficClass.GENERAL, None, "m", 2048, 4096,
+                "payload", TrafficClass.GENERAL, None, "m", 2048, 4096, "test-member",
                 thinking_budget_tokens=1024,
             )
         )
-        self.assertEqual(body["max_tokens"], 4096)
+        self.assertEqual(body["shared"]["max_tokens"], 4096)
 
 
 class CompressorThinkingBudgetWiringTest(CompressorTestCase):
@@ -576,7 +576,7 @@ class CompressorThinkingBudgetWiringTest(CompressorTestCase):
         self.compressor.compress(_BIG_PAYLOAD, TrafficClass.GENERAL)
         sent_body = _json.loads(self.fake.last_body)
         self.assertEqual(
-            sent_body["thinking"], {"type": "enabled", "budget_tokens": 1024}
+            sent_body["shared"]["thinking"], {"type": "enabled", "budget_tokens": 1024}
         )
 
 
