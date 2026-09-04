@@ -21,6 +21,8 @@ from acp.queue_codec_json import (
     ARRAY_RESPONSE_JSON_SCHEMA,
     QUEUE_JSON_SKELETON_ARRAY_ADDENDUM,
     QUEUE_JSON_SKELETON_DICT_ADDENDUM,
+    QUEUE_JSON_SKELETON_REF_ARRAY_ADDENDUM,
+    QUEUE_JSON_SKELETON_REF_DICT_ADDENDUM,
     build_queue_response_format,
     parse_queue_member_result_json,
     parse_queue_member_result_json_array,
@@ -370,6 +372,84 @@ class SkeletonAddendumTest(unittest.TestCase):
             with self.subTest(addendum=addendum[:40]):
                 self.assertIn("<", addendum)
                 self.assertIn(">", addendum)
+
+
+class HybridAnchorAddendumTest(unittest.TestCase):
+    """Final variant: skeleton anchors ("<MODE>", "<OUTPUT>") for the two
+    semantically loaded fields, each resolved by a matching "Definitions:"
+    block below the skeleton, `$ref`/`$defs`-style. Same wire shape/parsers
+    as the plain skeleton addenda -- only the prompt text differs, so these
+    tests check the addendum text itself, not parsing behavior (already
+    covered by `_STRICT_PARSERS` tests elsewhere in this file)."""
+
+    _REF_ADDENDA = (QUEUE_JSON_SKELETON_REF_DICT_ADDENDUM, QUEUE_JSON_SKELETON_REF_ARRAY_ADDENDUM)
+
+    def test_both_addenda_use_anchor_tokens_instead_of_literal_example_values_for_mode_and_output(self) -> None:
+        for addendum in self._REF_ADDENDA:
+            with self.subTest(addendum=addendum[:40]):
+                self.assertIn('"mode": "<MODE>"', addendum)
+                self.assertIn('"output": "<OUTPUT>"', addendum)
+                # The plain skeleton addenda's literal example values must
+                # NOT leak into the hybrid variant -- that would defeat the
+                # point of using an anchor instead.
+                self.assertNotIn('"mode": "PASS"', addendum)
+                self.assertNotIn('"mode": "COMPACT"', addendum)
+
+    def test_every_anchor_used_in_the_skeleton_has_a_matching_definition_below_it(self) -> None:
+        # The whole point of the pattern: a skeleton position's anchor
+        # token must reappear verbatim as a "Definitions:" entry so the
+        # two can be matched by spelling alone.
+        for addendum in self._REF_ADDENDA:
+            with self.subTest(addendum=addendum[:40]):
+                self.assertIn("Definitions:", addendum)
+                skeleton_part, _, definitions_part = addendum.partition("Definitions:")
+                for anchor in ("<MODE>", "<OUTPUT>"):
+                    self.assertIn(anchor, skeleton_part)
+                    self.assertIn(f"{anchor} --", definitions_part)
+
+    def test_mode_definition_enumerates_all_three_allowed_values_with_meaning(self) -> None:
+        for addendum in self._REF_ADDENDA:
+            with self.subTest(addendum=addendum[:40]):
+                _, _, definitions_part = addendum.partition("Definitions:")
+                for mode in ("PASS", "COMPACT", "COMPRESS"):
+                    self.assertIn(f'"{mode}"', definitions_part)
+
+    def test_addenda_warn_against_emitting_the_literal_anchor_tokens(self) -> None:
+        for addendum in self._REF_ADDENDA:
+            with self.subTest(addendum=addendum[:40]):
+                self.assertIn("must be replaced", addendum)
+
+    def test_neither_addendum_can_hardcode_real_member_ids(self) -> None:
+        # Same static-prefix constraint as the plain skeleton addenda (§9,
+        # §12) -- unaffected by the anchor/definitions indirection, which
+        # only concerns "mode"/"output", never the id placeholders.
+        for addendum in self._REF_ADDENDA:
+            with self.subTest(addendum=addendum[:40]):
+                self.assertIn("<the id from", addendum)
+
+    def test_ref_dict_addendum_still_describes_an_object_shape(self) -> None:
+        self.assertIn("{", QUEUE_JSON_SKELETON_REF_DICT_ADDENDUM)
+        self.assertIn("}", QUEUE_JSON_SKELETON_REF_DICT_ADDENDUM)
+        self.assertNotIn("Respond with exactly one JSON array", QUEUE_JSON_SKELETON_REF_DICT_ADDENDUM)
+
+    def test_ref_array_addendum_still_describes_an_array_shape(self) -> None:
+        self.assertIn("[", QUEUE_JSON_SKELETON_REF_ARRAY_ADDENDUM)
+        self.assertIn("]", QUEUE_JSON_SKELETON_REF_ARRAY_ADDENDUM)
+        self.assertIn('"id":', QUEUE_JSON_SKELETON_REF_ARRAY_ADDENDUM)
+
+    def test_ref_variants_still_parse_with_the_same_hardened_parsers(self) -> None:
+        # This variant only changes prompt text, not wire shape -- a
+        # response written to satisfy it must still round-trip through the
+        # existing hardened parsers unchanged.
+        dict_response = json.dumps({"m1": {"mode": "COMPACT", "output": "short"}})
+        result = parse_queue_member_result_json(dict_response, "m1")
+        self.assertEqual(result.mode, "COMPACT")
+        self.assertEqual(result.output, "short")
+
+        array_response = json.dumps([{"id": "m1", "mode": "COMPRESS", "output": "tiny"}])
+        result = parse_queue_member_result_json_array(array_response, "m1")
+        self.assertEqual(result.mode, "COMPRESS")
+        self.assertEqual(result.output, "tiny")
 
 
 @unittest.skipUnless(_HAS_JSONSCHEMA, "jsonschema package not installed in this environment")

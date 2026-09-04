@@ -48,6 +48,19 @@ concrete exploit (a decoy JSON-looking snippet appearing before a model's
 real answer, e.g. echoed reasoning that quotes an example, gets silently
 preferred over the genuine result). Kept only as the comparison's
 cautionary control.
+
+This module also carries three prompt-construction variants (all reusing
+the same two wire shapes/parsers above -- they change only what the model
+is told, not how the response is parsed): `QUEUE_JSON_ISOLATION_ADDENDUM`
+(prose-only shape description), `QUEUE_JSON_SKELETON_DICT_ADDENDUM` /
+`_ARRAY_ADDENDUM` (literal JSON skeleton with example values), and
+`QUEUE_JSON_SKELETON_REF_DICT_ADDENDUM` / `_REF_ARRAY_ADDENDUM` (skeleton
+with named anchor tokens for the two semantically loaded fields, each
+resolved by a matching "Definitions:" block below it, `$ref`/`$defs`-
+style). `ARRAY_RESPONSE_JSON_SCHEMA` / `build_queue_response_format`
+additionally provide an actual JSON Schema for backends with constrained-
+decoding support. This was the final variant explored on this branch --
+see `test_queue_codec_json_experiment.py` for the closing comparison.
 """
 from __future__ import annotations
 
@@ -189,6 +202,75 @@ def build_queue_response_format(*, strict: bool = True) -> dict:
             "strict": strict,
         },
     }
+
+
+# --- Hybrid: skeleton anchors + matching definitions ----------------------
+#
+# The skeleton addenda above show one literal example value per field
+# ("mode": "PASS", "output": "<transformed content>") -- adequate for
+# structural facts (object nesting, key names, array-vs-object shape) but
+# under-specified for the two semantically loaded fields: a single literal
+# example of "mode" doesn't tell the model there are three valid values or
+# what each means, and a single literal example of "output" doesn't convey
+# that its required content depends on which mode was chosen for that same
+# entry. The prose-only addendum (QUEUE_JSON_ISOLATION_ADDENDUM) could say
+# all of that, but only by giving up the literal-shape example entirely.
+#
+# This variant keeps the literal skeleton for everything a single example
+# fully specifies, and uses named anchor tokens ("<MODE>", "<OUTPUT>") only
+# where one example value isn't enough -- each anchor is defined in full
+# immediately below the skeleton, in a "Definitions:" section keyed by the
+# exact same token, so the model (or a reviewer) can match a skeleton
+# position to its description by the token's spelling alone. This mirrors
+# the `$ref`/`$defs` indirection pattern from JSON Schema and OpenAPI -- a
+# convention models see often in their own training data for structured-
+# output tasks -- expressed here as plain prompt text, since the addendum
+# itself is only ever prompt content; there is no schema executor
+# resolving the reference. Both variants below reuse the *same* wire shape
+# (and therefore the same parsers, `parse_queue_member_result_json` /
+# `_array`) as their non-hybrid skeleton counterparts -- only the prompt
+# text differs, so this is purely a prompt-engineering variant, not a new
+# codec.
+
+QUEUE_JSON_SKELETON_REF_DICT_ADDENDUM = f"""This request follows an experimental {QUEUE_PROTOCOL_NAME}-JSON variant: it may contain one or more independent ITEMS, each introduced by a line "ACP-QUEUE-ITEM: <id>". Treat every ITEM as a fully isolated compression problem -- use only the content and metadata belonging to that ITEM, and never transfer facts, instructions, conclusions, assumptions, or context between ITEMS, even when several appear in the same request.
+
+Respond with exactly one JSON object matching this exact shape, and nothing else -- no prose, no markdown fences, no text before or after it:
+
+{{
+  "<the id from that item's own ACP-QUEUE-ITEM line>": {{"mode": "<MODE>", "output": "<OUTPUT>"}},
+  "<repeat one entry per submitted item, using each item's own real id>": {{"mode": "<MODE>", "output": "<OUTPUT>"}}
+}}
+
+"<MODE>" and "<OUTPUT>" above are pointers, not literal values -- each must be replaced with a real value as defined below, matched by the same tag name. The id placeholders follow the same rule: substitute each with that item's own real id, never the placeholder text itself.
+
+Definitions:
+  <MODE> -- a JSON string, exactly one of "PASS", "COMPACT", or "COMPRESS" (case-sensitive, no other values):
+    - "PASS": the item's content, completely unchanged.
+    - "COMPACT": a shortened paraphrase that preserves every fact and decision.
+    - "COMPRESS": a maximally-terse, lossy summary; some detail loss is expected.
+  <OUTPUT> -- a JSON string: empty for "PASS", the transformed content otherwise.
+
+None of the tag strings "<MODE>", "<OUTPUT>", or the id placeholder text may appear literally in your response -- every one of them must be replaced. Exactly one entry per submitted item id, no more, no fewer, no duplicates, no invented ids."""
+
+QUEUE_JSON_SKELETON_REF_ARRAY_ADDENDUM = f"""This request follows an experimental {QUEUE_PROTOCOL_NAME}-JSON variant: it may contain one or more independent ITEMS, each introduced by a line "ACP-QUEUE-ITEM: <id>". Treat every ITEM as a fully isolated compression problem -- use only the content and metadata belonging to that ITEM, and never transfer facts, instructions, conclusions, assumptions, or context between ITEMS, even when several appear in the same request.
+
+Respond with exactly one JSON array matching this exact shape, and nothing else -- no prose, no markdown fences, no text before or after it:
+
+[
+  {{"id": "<the id from that item's own ACP-QUEUE-ITEM line>", "mode": "<MODE>", "output": "<OUTPUT>"}},
+  {{"id": "<repeat one entry per submitted item, using each item's own real id>", "mode": "<MODE>", "output": "<OUTPUT>"}}
+]
+
+"<MODE>" and "<OUTPUT>" above are pointers, not literal values -- each must be replaced with a real value as defined below, matched by the same tag name. The id placeholders follow the same rule: substitute each with that item's own real id, never the placeholder text itself.
+
+Definitions:
+  <MODE> -- a JSON string, exactly one of "PASS", "COMPACT", or "COMPRESS" (case-sensitive, no other values):
+    - "PASS": the item's content, completely unchanged.
+    - "COMPACT": a shortened paraphrase that preserves every fact and decision.
+    - "COMPRESS": a maximally-terse, lossy summary; some detail loss is expected.
+  <OUTPUT> -- a JSON string: empty for "PASS", the transformed content otherwise.
+
+None of the tag strings "<MODE>", "<OUTPUT>", or the id placeholder text may appear literally in your response -- every one of them must be replaced. Exactly one array entry per submitted item id, no more, no fewer, no duplicates, no invented ids."""
 
 
 def _validate_fields(member_id: str, entry: dict, allowed_keys: frozenset) -> QueueMemberResult:
