@@ -41,20 +41,6 @@ class MainDispatchTest(unittest.TestCase):
             self.assertEqual(main(), 0)
         self.assertEqual(buffer.getvalue(), "")
 
-    def test_subagent_stop_is_a_noop_on_codex_regardless_of_size(self) -> None:
-        # Codex has no SubagentStopHookSpecificOutputWire (confirmed by
-        # inspecting the compiled binary's schema) -- structurally cannot
-        # carry a block/retry decision, so this stays a no-op there.
-        stdin = io.StringIO(json.dumps({
-            "hook_event_name": "SubagentStop", "last_assistant_message": _LARGE_MESSAGE,
-            "stop_hook_active": False,
-        }))
-        buffer = io.StringIO()
-        with patch("sys.argv", ["subagent_report.py", "--agent", "codex"]), \
-             patch("sys.stdin", stdin), patch("sys.stdout", buffer):
-            self.assertEqual(main(), 0)
-        self.assertEqual(buffer.getvalue(), "")
-
     def test_subagent_stop_blocks_on_claude_for_oversized_report(self) -> None:
         stdin = io.StringIO(json.dumps({
             "hook_event_name": "SubagentStop", "last_assistant_message": _LARGE_MESSAGE,
@@ -90,6 +76,68 @@ class MainDispatchTest(unittest.TestCase):
             self.assertEqual(main(), 0)
         self.assertEqual(buffer.getvalue(), "")
 
+    # --- Codex path (C6/D4) ---
+    # Codex's SubagentStop event was confirmed (2026-09-03 follow-up pass,
+    # correcting an earlier "no SubagentStopHookSpecificOutputWire" finding
+    # that searched the compiled binary for the wrong string) to carry the
+    # same top-level decision/reason/stop_hook_active/last_assistant_message
+    # shape as Claude's. Unlike Claude, no host-side retry cap was observed
+    # live -- these tests mirror the Claude-path tests above to confirm the
+    # shared handler behaves identically for --agent codex, with special
+    # emphasis on the recursion-guard test since it is the only thing
+    # preventing unbounded retries on this host.
+
+    def test_subagent_stop_blocks_on_codex_for_oversized_report(self) -> None:
+        stdin = io.StringIO(json.dumps({
+            "hook_event_name": "SubagentStop", "last_assistant_message": _LARGE_MESSAGE,
+            "stop_hook_active": False,
+        }))
+        buffer = io.StringIO()
+        with patch("sys.argv", ["subagent_report.py", "--agent", "codex"]), \
+             patch("sys.stdin", stdin), patch("sys.stdout", buffer):
+            self.assertEqual(main(), 0)
+        payload = json.loads(buffer.getvalue())
+        self.assertEqual(payload["decision"], "block")
+        self.assertIn("report", payload["reason"])
+
+    def test_subagent_stop_respects_recursion_guard_on_codex(self) -> None:
+        # Load bearing on Codex: no confirmed host-side cap, so this guard
+        # is the only thing standing between a genuine retry loop and an
+        # unbounded one -- must never block twice regardless of size.
+        stdin = io.StringIO(json.dumps({
+            "hook_event_name": "SubagentStop", "last_assistant_message": _LARGE_MESSAGE,
+            "stop_hook_active": True,
+        }))
+        buffer = io.StringIO()
+        with patch("sys.argv", ["subagent_report.py", "--agent", "codex"]), \
+             patch("sys.stdin", stdin), patch("sys.stdout", buffer):
+            self.assertEqual(main(), 0)
+        self.assertEqual(buffer.getvalue(), "")
+
+    def test_subagent_stop_does_not_block_small_report_on_codex(self) -> None:
+        stdin = io.StringIO(json.dumps({
+            "hook_event_name": "SubagentStop", "last_assistant_message": _SMALL_MESSAGE,
+            "stop_hook_active": False,
+        }))
+        buffer = io.StringIO()
+        with patch("sys.argv", ["subagent_report.py", "--agent", "codex"]), \
+             patch("sys.stdin", stdin), patch("sys.stdout", buffer):
+            self.assertEqual(main(), 0)
+        self.assertEqual(buffer.getvalue(), "")
+
+    def test_subagent_stop_noop_for_unrecognized_agent(self) -> None:
+        # parse_args restricts --agent to claude/codex via argparse choices,
+        # but handle_stop itself is defense-in-depth: any other value must
+        # still fail open rather than assume Claude's behavior.
+        buffer = io.StringIO()
+        with patch("sys.stdout", buffer):
+            self.assertEqual(
+                handle_stop("some-other-agent", {
+                    "stop_hook_active": False, "last_assistant_message": _LARGE_MESSAGE,
+                }), 0,
+            )
+        self.assertEqual(buffer.getvalue(), "")
+
 
 class HandleStopTest(unittest.TestCase):
     def test_fails_open_on_non_string_message(self) -> None:
@@ -104,6 +152,20 @@ class HandleStopTest(unittest.TestCase):
         buffer = io.StringIO()
         with patch("sys.stdout", buffer):
             self.assertEqual(handle_stop("claude", {}), 0)
+        self.assertEqual(buffer.getvalue(), "")
+
+    def test_fails_open_on_non_string_message_codex(self) -> None:
+        buffer = io.StringIO()
+        with patch("sys.stdout", buffer):
+            self.assertEqual(
+                handle_stop("codex", {"stop_hook_active": False, "last_assistant_message": None}), 0,
+            )
+        self.assertEqual(buffer.getvalue(), "")
+
+    def test_fails_open_on_missing_fields_codex(self) -> None:
+        buffer = io.StringIO()
+        with patch("sys.stdout", buffer):
+            self.assertEqual(handle_stop("codex", {}), 0)
         self.assertEqual(buffer.getvalue(), "")
 
 

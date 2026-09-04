@@ -10,8 +10,22 @@ usage; confirmed idempotent -- re-adding the same name just overwrites).
 
 `~/.codex/hooks.json` is touched additively, same discipline as the
 Claude installer: this repo's hook commands (identified by a stable
-marker substring in each `command`) are merged into `hooks.SubagentStart`,
-leaving every other event and every agent-mem-struct entry untouched.
+marker substring in each `command`) are merged into `hooks.SubagentStart`
+and `hooks.SubagentStop`, leaving every other event and every
+agent-mem-struct entry untouched.
+
+`hooks.SubagentStop` (C6/D4, enforced bounded retry for oversized
+subagent reports) is now installed unconditionally, mirroring the Claude
+installer: Codex's `SubagentStop` event was confirmed (2026-09-03
+follow-up pass, see `acp/adapters/hooks/subagent_report.py`'s module
+docstring and the evaluation doc's D4 addendum) to support a real
+`decision:"block"`/`reason` retry, with `stop_hook_active` as the
+recursion guard -- but unlike Claude, Codex showed no evidence of a
+host-side retry cap in live testing, so `subagent_report.py`'s handler
+is written to self-limit to exactly one block regardless. This is a
+declared install-time step only -- it takes effect on whichever host(s)
+this installer is actually run against next; it does not itself touch
+any live `~/.codex` config until run.
 
 `hooks.PreToolUse` (matched to `spawn_agent`, for "parent -> child
 oversized support context") and shell-tool-exclusivity (disabling
@@ -144,6 +158,9 @@ def install(
     hook_specs = [
         ("SubagentStart", _SUBAGENT_REPORT_MODULE, "SubagentStart", dict(
             status_message="ACP: offer the report tool for a large final report", timeout=5)),
+        ("SubagentStop", _SUBAGENT_REPORT_MODULE, "SubagentStop", dict(
+            status_message="ACP: enforce report-tool use for oversized subagent output",
+            timeout=5)),
     ]
     if with_parent_child_context:
         hook_specs.append(("PreToolUse/spawn_agent", _PARENT_CHILD_CONTEXT_MODULE, "PreToolUse", dict(
