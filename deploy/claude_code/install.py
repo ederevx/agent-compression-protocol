@@ -24,13 +24,20 @@ applies to the Task tool is unconfirmed; see project_md's STATUS.md
 Phase 4 checkpoint. Pass `--with-parent-child-context` once that is
 empirically confirmed to also install it.
 
+`hooks.PreToolUse` matched to the `SendMessage` tool (C7, oversized
+delimited support-context block inside an outgoing inter-agent message,
+`acp/adapters/hooks/sendmessage_context.py`) is likewise NOT installed
+by default -- same unconfirmed-`updatedInput` caveat, this time for
+`SendMessage`. Pass `--with-sendmessage-context` once that is
+empirically confirmed.
+
 This does not start ACP itself -- run `deploy/install.sh` (or
 `deploy/acp.service` via your own supervisor) first, and AALP's own
 `deploy/install.sh` in `agent-api-lane-protocol` before that, since ACP
 requires a reachable AALP instance to actually compress (it fails open,
 not silently, if AALP is unreachable -- see `acp/aalp_client.py`).
 
-Usage: python3 deploy/claude_code/install.py [--dry-run] [--with-parent-child-context]
+Usage: python3 deploy/claude_code/install.py [--dry-run] [--with-parent-child-context] [--with-sendmessage-context]
 """
 from __future__ import annotations
 
@@ -68,6 +75,7 @@ def _hook_command(module: str, extra_args: str = "") -> str:
 
 _SUBAGENT_REPORT_MODULE = "acp.adapters.hooks.subagent_report"
 _PARENT_CHILD_CONTEXT_MODULE = "acp.adapters.hooks.parent_child_context"
+_SENDMESSAGE_CONTEXT_MODULE = "acp.adapters.hooks.sendmessage_context"
 
 
 def _load_json(path: Path) -> dict:
@@ -135,7 +143,9 @@ def _ensure_hook_entry(
     return True
 
 
-def install(dry_run: bool, with_parent_child_context: bool) -> int:
+def install(
+    dry_run: bool, with_parent_child_context: bool, with_sendmessage_context: bool,
+) -> int:
     claude_json_path = Path.home() / ".claude.json"
     settings_path = Path.home() / ".claude" / "settings.json"
 
@@ -167,6 +177,10 @@ def install(dry_run: bool, with_parent_child_context: bool) -> int:
         hook_specs.append(("PreToolUse/Task", _PARENT_CHILD_CONTEXT_MODULE, "PreToolUse", dict(
             status_message="ACP: compress delimited oversized support context",
             timeout=30, matcher="Task")))
+    if with_sendmessage_context:
+        hook_specs.append(("PreToolUse/SendMessage", _SENDMESSAGE_CONTEXT_MODULE, "PreToolUse", dict(
+            status_message="ACP: compress delimited oversized support context in SendMessage",
+            timeout=30, matcher="SendMessage")))
 
     hook_changes = {}
     for label, module, event_name, kwargs in hook_specs:
@@ -208,8 +222,18 @@ def main(argv: list[str] | None = None) -> int:
             "to the Task tool."
         ),
     )
+    parser.add_argument(
+        "--with-sendmessage-context", action="store_true",
+        help=(
+            "Also install the PreToolUse/SendMessage hook for oversized "
+            "delimited support-context compression in outgoing inter-agent "
+            "messages -- newly built (C7), off by default; only once "
+            "Claude Code's PreToolUse.updatedInput is empirically "
+            "confirmed to apply to the SendMessage tool."
+        ),
+    )
     args = parser.parse_args(argv)
-    return install(args.dry_run, args.with_parent_child_context)
+    return install(args.dry_run, args.with_parent_child_context, args.with_sendmessage_context)
 
 
 if __name__ == "__main__":
