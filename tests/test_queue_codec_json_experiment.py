@@ -23,6 +23,9 @@ from acp.queue_codec_json import (
     QUEUE_JSON_SKELETON_DICT_ADDENDUM,
     QUEUE_JSON_SKELETON_REF_ARRAY_ADDENDUM,
     QUEUE_JSON_SKELETON_REF_DICT_ADDENDUM,
+    RECOMMENDED_ADDENDUM,
+    RECOMMENDED_PARSER,
+    RECOMMENDED_RESPONSE_FORMAT,
     build_queue_response_format,
     parse_queue_member_result_json,
     parse_queue_member_result_json_array,
@@ -450,6 +453,29 @@ class HybridAnchorAddendumTest(unittest.TestCase):
         result = parse_queue_member_result_json_array(array_response, "m1")
         self.assertEqual(result.mode, "COMPRESS")
         self.assertEqual(result.output, "tiny")
+
+
+class ClosingRecommendationTest(unittest.TestCase):
+    """The branch's closing recommendation is exposed as three aliases
+    rather than restated -- these tests only confirm the aliases actually
+    point at the variants the recommendation names, so the comment and the
+    code can't silently drift apart."""
+
+    def test_recommended_parser_is_the_hardened_array_parser(self) -> None:
+        self.assertIs(RECOMMENDED_PARSER, parse_queue_member_result_json_array)
+
+    def test_recommended_addendum_is_the_hybrid_anchor_array_addendum(self) -> None:
+        self.assertIs(RECOMMENDED_ADDENDUM, QUEUE_JSON_SKELETON_REF_ARRAY_ADDENDUM)
+
+    def test_recommended_response_format_builder_is_the_schema_wrapper(self) -> None:
+        self.assertIs(RECOMMENDED_RESPONSE_FORMAT, build_queue_response_format)
+
+    def test_recommended_combination_round_trips_end_to_end(self) -> None:
+        response_format = RECOMMENDED_RESPONSE_FORMAT()
+        self.assertEqual(response_format["json_schema"]["schema"], ARRAY_RESPONSE_JSON_SCHEMA)
+        body = json.dumps([{"id": "m1", "mode": "PASS", "output": ""}])
+        result = RECOMMENDED_PARSER(body, "m1")
+        self.assertEqual(result.mode, "PASS")
 
 
 @unittest.skipUnless(_HAS_JSONSCHEMA, "jsonschema package not installed in this environment")

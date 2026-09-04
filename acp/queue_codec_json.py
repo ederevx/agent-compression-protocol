@@ -432,3 +432,62 @@ def parse_queue_member_result_json_lenient_search(text: str, member_id: str) -> 
     if entry is None:
         raise QueueProtocolViolation(f"no entry found for member id {member_id!r}")
     return _validate_entry(member_id, entry, strict=True)
+
+
+# --- Closing recommendation (2026-09-04) -----------------------------------
+#
+# Comparing every variant built on this branch against the same
+# contamination/robustness properties `test_queue_contamination.py`
+# established for the shipped `queue_codec.py` textual grammar:
+#
+#   naive dict     -- duplicate top-level key silently overwritten (last
+#                     write wins); escapes the textual grammar's
+#                     truncation-only limitation for free (JSON string
+#                     escaping means embedded fake headers can never be
+#                     reinterpreted); NOT SAFE, ruled out.
+#   hardened dict  -- duplicate key rejected via `object_pairs_hook`;
+#                     escapes truncation for free; per-entry values are
+#                     schema-constrainable via `additionalProperties`, but
+#                     the duplicate-key defense is invisible to any schema
+#                     validator regardless (destroyed by `json.loads`
+#                     before validation ever runs) -- schema support adds
+#                     nothing this shape's own parser doesn't already do.
+#   hardened array -- duplicate id rejected via an explicit post-parse
+#                     check (no free protection the way `object_pairs_hook`
+#                     gives the dict shape); escapes truncation for free;
+#                     the ONLY shape a full, literal JSON Schema can be
+#                     written against with no workaround, since array
+#                     items have a fixed shape unlike the dict shape's
+#                     runtime-id keys.
+#   lenient-search -- exploitable by a decoy JSON-looking snippet earlier
+#                     in the response; NOT SAFE, ruled out, kept only as a
+#                     cautionary control.
+#
+# Recommended combination for this experiment -- the one to carry into any
+# future live-activation test (still separately gated; not performed on
+# this branch):
+#   - Wire shape + parser: `parse_queue_member_result_json_array` -- the
+#     array shape's lack of "free" duplicate protection is not actually a
+#     cost difference (the dict shape's protection is itself just a custom
+#     hook, not zero-effort), and its full schema-describability is a real
+#     advantage the dict shape cannot match without a workaround.
+#   - Prompt construction: `QUEUE_JSON_SKELETON_REF_ARRAY_ADDENDUM` --
+#     keeps the literal skeleton's structural clarity while adding full
+#     "mode"/"output" semantics via matched anchors, avoiding both the
+#     plain skeleton's under-specification and prose-only's verbosity.
+#   - Enforcement: `build_queue_response_format()` (wrapping
+#     `ARRAY_RESPONSE_JSON_SCHEMA`) attached wherever a live backend
+#     advertises constrained-decoding support, as defense in depth -- NOT
+#     a substitute for `parse_queue_member_result_json_array`'s own
+#     duplicate-id check, which stays regardless of schema support.
+#
+# This is a design recommendation, not a decision to replace the shipped
+# `queue_codec.py` grammar in `compressor.py`/`aalp_client.py`. Every
+# property compared above is structural/adversarial against fixtures, not
+# evidence of real model behavior -- promotion past this prototype needs
+# the same separately-authorized live-activation pass every other stage of
+# this project is gated behind, run specifically against this combination.
+
+RECOMMENDED_PARSER = parse_queue_member_result_json_array
+RECOMMENDED_ADDENDUM = QUEUE_JSON_SKELETON_REF_ARRAY_ADDENDUM
+RECOMMENDED_RESPONSE_FORMAT = build_queue_response_format
