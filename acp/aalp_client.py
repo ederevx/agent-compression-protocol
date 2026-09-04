@@ -55,6 +55,7 @@ _NON_SUCCESS_OUTCOMES: dict[str, Outcome] = {
     "total_timeout": Outcome.TOTAL_TIMEOUT,
     "invalid_response": Outcome.INVALID_RESPONSE,
     "upstream_error": Outcome.UPSTREAM_ERROR,
+    "maintenance": Outcome.MAINTENANCE,
 }
 
 

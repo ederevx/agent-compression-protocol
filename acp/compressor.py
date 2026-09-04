@@ -28,8 +28,10 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
+from acp import bypass
 from acp import gate
 from acp import provenance as provenance_mod
 from acp.aalp_client import AalpClient
@@ -375,6 +377,7 @@ class Compressor:
         compression_timeout: float = DEFAULT_COMPRESSION_TIMEOUT_SECONDS,
         total_timeout: float = DEFAULT_TOTAL_TIMEOUT_SECONDS,
         thresholds: dict[TrafficClass, TrafficClassThresholds] | None = None,
+        root: str | Path | None = None,
     ) -> None:
         self._aalp_client = aalp_client
         self._telemetry = telemetry
@@ -385,6 +388,7 @@ class Compressor:
         self._compression_timeout = compression_timeout
         self._total_timeout = total_timeout
         self._thresholds = thresholds
+        self._root = root
         self._warnings = CompressionWarningTracker()
 
     @property
@@ -399,6 +403,22 @@ class Compressor:
         flow_id: str | None = None,
     ) -> CompressionResult:
         source_hash = provenance_mod.compute_hash(payload)
+
+        if bypass.is_bypass_mode(self._root):
+            # Cheapest possible check, ahead of gate.evaluate() and any
+            # AALP call: an operator's flag file must pre-empt everything.
+            # No telemetry call is reached on this path -- planned-
+            # downtime bypass activity must never skew historical
+            # compression statistics (explicit requirement).
+            new_provenance = Provenance(processed=True, source_hash=source_hash)
+            return CompressionResult(
+                outcome=Outcome.MAINTENANCE,
+                mode="PASS",
+                output=payload,
+                warnings=[],
+                message="ACP is in bypass mode",
+                provenance=new_provenance,
+            )
 
         decision = gate.evaluate(payload, traffic_class, thresholds=self._thresholds)
 
@@ -530,6 +550,23 @@ class Compressor:
         elapsed_seconds: float,
         source_hash: str,
     ) -> CompressionResult:
+        # AALP itself in maintenance mode (as opposed to ACP's own bypass
+        # short-circuit at the top of compress(), which never reaches
+        # this method at all): treated the same way for telemetry -- no
+        # counters, no warning-tracker update. Planned-downtime activity
+        # on either side of the AALP boundary must never skew historical
+        # compression statistics (explicit requirement).
+        if outcome is Outcome.MAINTENANCE:
+            new_provenance = Provenance(processed=True, source_hash=source_hash)
+            return CompressionResult(
+                outcome=outcome,
+                mode="PASS",
+                output=payload,
+                warnings=[],
+                message=failure_message,
+                provenance=new_provenance,
+            )
+
         counter_name = _TIMEOUT_COUNTER_BY_OUTCOME.get(outcome)
         self._telemetry.increment(counter_name or _UNCOUNTERED_FAILURE_BUCKET)
 

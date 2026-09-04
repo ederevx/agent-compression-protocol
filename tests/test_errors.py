@@ -4,13 +4,14 @@ from acp.errors import AcpResult, Outcome, TrafficClass
 
 
 class OutcomeTest(unittest.TestCase):
-    def test_exactly_seven_outcomes(self) -> None:
+    def test_exactly_eight_outcomes(self) -> None:
         names = {member.name for member in Outcome}
         self.assertEqual(
             names,
             {
                 "SUCCESS", "UNAVAILABLE", "QUEUE_TIMEOUT", "COMPRESSION_TIMEOUT",
                 "TOTAL_TIMEOUT", "INVALID_RESPONSE", "UPSTREAM_ERROR",
+                "MAINTENANCE",
             },
         )
 
