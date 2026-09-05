@@ -720,6 +720,71 @@ class CompressorReasoningEffortWiringTest(CompressorTestCase):
         self.assertNotIn("budget_tokens", sent_body["shared"]["thinking"])
 
 
+class TemperatureTopPRequestBodyTest(unittest.TestCase):
+    """`_build_request_body` shape correctness for `temperature`/`top_p`
+    -- independent of each other and of the thinking axes, omitted from
+    the body entirely when left unset."""
+
+    def test_default_omits_both_fields(self) -> None:
+        body = _json.loads(
+            _build_request_body("payload", TrafficClass.GENERAL, None, "m", 256, 512, "test-member")
+        )
+        self.assertNotIn("temperature", body["shared"])
+        self.assertNotIn("top_p", body["shared"])
+
+    def test_temperature_alone_reaches_body(self) -> None:
+        body = _json.loads(
+            _build_request_body(
+                "payload", TrafficClass.GENERAL, None, "m", 256, 512, "test-member",
+                temperature=0.7,
+            )
+        )
+        self.assertEqual(body["shared"]["temperature"], 0.7)
+        self.assertNotIn("top_p", body["shared"])
+
+    def test_top_p_alone_reaches_body(self) -> None:
+        body = _json.loads(
+            _build_request_body(
+                "payload", TrafficClass.GENERAL, None, "m", 256, 512, "test-member",
+                top_p=0.9,
+            )
+        )
+        self.assertEqual(body["shared"]["top_p"], 0.9)
+        self.assertNotIn("temperature", body["shared"])
+
+    def test_both_can_be_set_together(self) -> None:
+        body = _json.loads(
+            _build_request_body(
+                "payload", TrafficClass.GENERAL, None, "m", 256, 512, "test-member",
+                temperature=0.3, top_p=0.5,
+            )
+        )
+        self.assertEqual(body["shared"]["temperature"], 0.3)
+        self.assertEqual(body["shared"]["top_p"], 0.5)
+
+
+class CompressorTemperatureTopPWiringTest(CompressorTestCase):
+    """`Compressor(temperature=..., top_p=...)` must actually reach the
+    outbound body, end-to-end via the fake AALP fixture."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.compressor = Compressor(
+            self.client, self.telemetry, temperature=0.3, top_p=0.5
+        )
+
+    def test_temperature_and_top_p_reach_outbound_request(self) -> None:
+        self._add_ci_provider()
+        self.fake.program_response(
+            "ci", "/v1/messages", outcome="success",
+            body=_compressor_body("COMPACT", "ok"),
+        )
+        self.compressor.compress(_BIG_PAYLOAD, TrafficClass.GENERAL)
+        sent_body = _json.loads(self.fake.last_body)
+        self.assertEqual(sent_body["shared"]["temperature"], 0.3)
+        self.assertEqual(sent_body["shared"]["top_p"], 0.5)
+
+
 class ResponseCodecJsonArrayTest(CompressorTestCase):
     """Proves `Compressor(response_codec=RESPONSE_CODEC_JSON_ARRAY)` isn't
     just inert wiring: the outbound request actually carries the JSON-

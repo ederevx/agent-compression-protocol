@@ -133,6 +133,13 @@ _MIN_OUTPUT_HEADROOM_ABOVE_THINKING = 256
 # this mode), so combining both would be an ambiguous request shape.
 DEFAULT_REASONING_EFFORT: str | None = None
 
+# Standard Anthropic Messages API sampling controls, independent of the
+# thinking/reasoning_effort axes above -- passed through untouched by
+# `ci`'s passthrough shape when set, left out of the body entirely
+# (letting the backend's own default apply) when `None`.
+DEFAULT_TEMPERATURE: float | None = None
+DEFAULT_TOP_P: float | None = None
+
 # Mirrors `AalpClient.forward`'s own defaults; these are ACP-side
 # round-trip budgets layered on top of AALP's internal ones (see
 # `acp/aalp_client.py`'s `forward()` docstring).
@@ -306,6 +313,8 @@ def _build_request_body(
     thinking_budget_tokens: int | None = None,
     response_codec: str = RESPONSE_CODEC_TEXTUAL,
     reasoning_effort: str | None = None,
+    temperature: float | None = None,
+    top_p: float | None = None,
 ) -> bytes:
     """Build this call's self-describing queue envelope (§10-§12) -- not
     a fully-built physical request body. `shared` is the physical
@@ -321,7 +330,11 @@ def _build_request_body(
     exclusive (enforced at `Compressor` construction, not here) -- when
     `reasoning_effort` is set, `thinking` is enabled without a numeric
     `budget_tokens`, since that's DeepSeek's own request shape for this
-    field, not Anthropic's."""
+    field, not Anthropic's.
+
+    `temperature`/`top_p` are independent of both thinking axes and of
+    each other -- each is included in the body only when explicitly
+    set, otherwise omitted so the backend's own default applies."""
     if thinking_budget_tokens is not None:
         max_tokens = max(
             max_tokens, thinking_budget_tokens + _MIN_OUTPUT_HEADROOM_ABOVE_THINKING
@@ -352,6 +365,10 @@ def _build_request_body(
             "type": "enabled",
             "budget_tokens": thinking_budget_tokens,
         }
+    if temperature is not None:
+        shared["temperature"] = temperature
+    if top_p is not None:
+        shared["top_p"] = top_p
     member = QueueMemberRequest(member_id=member_id, content=user_message)
     return queue_codec.build_queue_envelope(shared, _CONTENT_PATH, member)
 
@@ -453,6 +470,8 @@ class Compressor:
         root: str | Path | None = None,
         response_codec: str = RESPONSE_CODEC_TEXTUAL,
         reasoning_effort: str | None = DEFAULT_REASONING_EFFORT,
+        temperature: float | None = DEFAULT_TEMPERATURE,
+        top_p: float | None = DEFAULT_TOP_P,
     ) -> None:
         if response_codec not in _RESPONSE_CODECS:
             raise ValueError(f"unknown response_codec {response_codec!r}")
@@ -467,6 +486,8 @@ class Compressor:
         self._model = model
         self._thinking_budget_tokens = thinking_budget_tokens
         self._reasoning_effort = reasoning_effort
+        self._temperature = temperature
+        self._top_p = top_p
         self._queue_timeout = queue_timeout
         self._compression_timeout = compression_timeout
         self._total_timeout = total_timeout
@@ -535,6 +556,8 @@ class Compressor:
             target_tokens, max_tokens, member_id, self._thinking_budget_tokens,
             response_codec=self._response_codec,
             reasoning_effort=self._reasoning_effort,
+            temperature=self._temperature,
+            top_p=self._top_p,
         )
 
         # request.queue rather than request.forward (§13's "queue-of-one
@@ -548,7 +571,8 @@ class Compressor:
         # what coalescing is meant to combine across calls.
         queue_key = (
             f"acp-queue/1:{self._provider_id}:{_FORWARD_PATH}:"
-            f"{self._model}:{self._thinking_budget_tokens}:{self._reasoning_effort}"
+            f"{self._model}:{self._thinking_budget_tokens}:{self._reasoning_effort}:"
+            f"{self._temperature}:{self._top_p}"
         )
 
         started = time.monotonic()
