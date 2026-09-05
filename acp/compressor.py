@@ -602,6 +602,24 @@ class Compressor:
         parsed_output: str | None = None
         usage: dict[str, Any] | None = None
 
+        # AALP classifies purely at the transport level (agent_protocols_v1
+        # _metadata_v1.md §18): a passed-through 4xx/5xx from the upstream
+        # provider is still Outcome.SUCCESS as far as AALP is concerned,
+        # since interpreting the status/body is this layer's job, not
+        # AALP's. A 429 body is never Messages-shaped, so left unchecked it
+        # would otherwise fall into the generic parse-failure branch below
+        # and come out indistinguishable from a real malformed response --
+        # confirmed live against `ci`: a fair-use throttle on the account
+        # returns `{"type":"error","error":{"type":"rate_limit_error",...}}`
+        # with no `content` key, which is exactly the shape
+        # _parse_compressor_response raises CompressorProtocolViolation for.
+        if outcome is Outcome.SUCCESS and queue_result.status == 429:
+            outcome = Outcome.RATE_LIMITED
+            failure_message = (
+                queue_result.body.decode("utf-8", errors="replace")
+                if queue_result.body else "rate limited (HTTP 429)"
+            )
+
         if outcome is Outcome.SUCCESS:
             try:
                 parsed_mode, parsed_output, usage = _parse_compressor_response(

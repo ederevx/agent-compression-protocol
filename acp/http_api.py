@@ -64,6 +64,7 @@ _STATUS_BY_OUTCOME: dict[Outcome, int] = {
     Outcome.COMPRESSION_TIMEOUT: 504,
     Outcome.INVALID_RESPONSE: 502,
     Outcome.UPSTREAM_ERROR: 502,
+    Outcome.RATE_LIMITED: 429,
 }
 
 _JSON_HEADERS = {"Content-Type": "application/json"}

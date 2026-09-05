@@ -18,6 +18,7 @@ class Outcome(Enum):
     TOTAL_TIMEOUT = "total_timeout"
     INVALID_RESPONSE = "invalid_response"
     UPSTREAM_ERROR = "upstream_error"
+    RATE_LIMITED = "rate_limited"
     MAINTENANCE = "maintenance"
 
 

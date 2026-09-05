@@ -492,6 +492,42 @@ class MalformedResponseTest(CompressorTestCase):
         self.assertIs(result.outcome, Outcome.INVALID_RESPONSE)
 
 
+class RateLimitResponseTest(CompressorTestCase):
+    """A 429 passthrough is transport-level Outcome.SUCCESS as far as AALP
+    is concerned (agent_protocols_v1_metadata_v1.md §18) -- confirmed live
+    against `ci`, a fair-use throttle comes back as a non-Messages-shaped
+    error body with no `content` key. Left undetected this would fall into
+    the generic parse-failure branch and be indistinguishable from a real
+    malformed response; it must classify as its own distinct outcome
+    instead so a caller (or a benchmark harness) can tell "backend is
+    throttling us, back off" apart from "backend sent us garbage"."""
+
+    def test_429_status_is_rate_limited_not_invalid_response(self) -> None:
+        self._add_ci_provider()
+        self.fake.program_response(
+            "ci", "/v1/messages", outcome="success", status=429,
+            body=json.dumps({
+                "type": "error",
+                "error": {"type": "rate_limit_error", "message": "throttled"},
+            }).encode(),
+        )
+        result = self.compressor.compress(_BIG_PAYLOAD, TrafficClass.GENERAL)
+        self.assertIs(result.outcome, Outcome.RATE_LIMITED)
+        self.assertIn("rate_limit_error", result.message)
+
+    def test_non_429_non_messages_body_is_still_invalid_response(self) -> None:
+        # Guards against over-broadening the new check: only a 429 status
+        # gets reclassified, everything else keeps falling through to the
+        # existing generic parse-failure path.
+        self._add_ci_provider()
+        self.fake.program_response(
+            "ci", "/v1/messages", outcome="success", status=500,
+            body=b"internal server error, not json",
+        )
+        result = self.compressor.compress(_BIG_PAYLOAD, TrafficClass.GENERAL)
+        self.assertIs(result.outcome, Outcome.INVALID_RESPONSE)
+
+
 class FailureOutcomeTest(CompressorTestCase):
     def _program_failure(self, outcome_name: str) -> None:
         self._add_ci_provider()
