@@ -51,10 +51,49 @@ against the real backend instead of a fake connection).
 | `textual`    | 58/63   | 5    | 92%  |
 | `json_array` | 43/63   | 20   | 68%  |
 
-`textual`'s 5 failures were scattered (1 at small/width=1, 2 at
-medium/width=2, 2 at large/width=2) with no clear correlation to size or
-width — consistent with ordinary real-backend flakiness under concurrent
-load, not a codec defect.
+**Follow-up investigation (post-report):** `textual`'s 5 failures were
+initially written up as generic scattered flakiness. Re-examined against
+the raw per-trial data
+(`/tmp/queue_coalescing_live_sweep_results.json`), they split into two
+distinct, identifiable root causes, not one uniform cause:
+
+- **Model protocol non-adherence (2 incidents, 3 of 5 failed members):**
+  `small/width=1/repeat=0` (2.10s, solo member) and
+  `large/width=2/repeat=2` (7.81s, both coalesced members) — both took
+  normal real-completion time (matching the 2-24s range every genuine
+  success in this sweep falls in), but the model's actual text response
+  never contained an `ACP-QUEUE-ITEM:` block at all
+  (`"no ACP-QUEUE-ITEM blocks found in response"`). `queue_codec.py`'s own
+  addendum is explicit that its framing applies *"even when only one ITEM
+  is present"*, so this is a real instruction-following miss, not an
+  ambiguity in the prompt. Plausibly aggravated by this sweep's own
+  synthetic corpus (`make_payload()`'s degenerate, thousands-of-times-
+  repeated `"log line filler content..."` filler is not representative of
+  real payload text) — flagged as a caveat on the failure rate, not a
+  confirmed cause. Independent of that, this is a live confirmation of
+  §19's whole-generation-failure design: at `width=2` one bad completion
+  took out *both* legitimate coalesced members, not just one — the
+  blast radius of a non-adherent completion scales with width.
+- **Upstream error body passed through as `Outcome.SUCCESS` (1 incident,
+  2 of 5 failed members):** `medium/width=2/repeat=1` — both members
+  failed in 0.58s, roughly an order of magnitude faster than every real
+  completion elsewhere in the sweep. `aalp/forwarder.py` documents its own
+  design outright: *"4xx/5xx from the upstream API is still
+  `Outcome.SUCCESS`... the gateway — not this module — interprets the
+  passed-through status/body."* AALP's success determination is
+  transport-level only; it does not validate that the body is actually
+  Messages-shaped. The timing here is consistent with the `ci` proxy
+  returning a fast error/overload response (under concurrent load from
+  the occupier plus 2 coalesced members hitting a `concurrency_limit=1`
+  lane at once) that AALP relayed as "success" and only ACP's own
+  body-shape check caught downstream. No raw body was captured for this
+  call, so this is the best-supported reading of the timing/error-shape
+  evidence, not a confirmed root cause.
+
+This second failure mode is the same `CompressorProtocolViolation:
+...not a parseable Messages-shaped body: 'content'` signature that
+accounts for **all 20** of `json_array`'s failures below — see the
+revised reading of that hypothesis after the reliability table.
 
 `json_array`'s 20 failures were **not** scattered: all 20 occurred at the
 **large** corpus size, and nowhere else — 20 of 21 large-size member
@@ -90,18 +129,40 @@ wasn't used in this ad hoc follow-up). Neither diagnostic call reproduced
 a failure, so the real upstream error body was never actually captured —
 only the parse-level message the sweep itself recorded
 (`compressor response is not a parseable Messages-shaped body: 'content'`)
-is available. The failure is real (20/21 large-size `json_array` calls in
-the sweep proper failed) and reproducibly concentrated at `large` size,
-but its probabilistic rather than 100%-deterministic nature, combined with
-not having captured a raw failing response body, means the
-`response_format`-at-scale explanation above is the best-supported
-hypothesis from this data, not a confirmed root cause.
+is available.
+
+**Revised reading (post-report investigation):** this exact failure
+signature — `'content'` missing from the response body entirely — is
+also what `textual`'s own `medium/width=2/repeat=1` incident produced
+(above), where the anomalously fast 0.58s round-trip pointed to an
+upstream error body relayed through as `Outcome.SUCCESS` by AALP's
+transport-only success check (`aalp/forwarder.py`), not a `response_format`
+problem. Since `json_array`'s 20 failures share that identical signature,
+at least some — plausibly most or all — could be the same shared
+AALP/backend-boundary gap (fast overload/error responses from `ci` under
+load, indistinguishable at the ACP layer from a `response_format`-caused
+malformed body) rather than something specific to JSON-schema-constrained
+decoding. Large-size requests are also the most concurrency/load-stressing
+requests in this sweep (biggest combined payload, most provider-side
+work), which is an equally plausible reason for upstream overload errors
+to concentrate there, independent of which response codec was in use.
+The `response_format`-at-scale explanation is therefore weaker than
+originally written: it remains *plausible* (JSON-array failures were
+still far more concentrated at `large` than `textual`'s were, and
+`response_format` is a genuine per-codec difference), but it is no
+longer the best-supported explanation on its own — an upstream-overload
+explanation shared with `textual`'s root cause B fits the same evidence
+at least as well, and this pass cannot distinguish between them without
+a captured raw failing body.
 
 This sweep did not isolate `response_format` from the rest of
-`json_array`'s prompt/parsing design as the sole cause (that would need a
-fourth configuration: JSON-array wire shape *without* `response_format`,
-and ideally capturing a raw failing response body rather than only the
-parse failure) — flagged as follow-up work, not done here.
+`json_array`'s prompt/parsing design as the sole cause, nor did it
+distinguish a `response_format`-specific failure from a shared
+upstream-overload failure carrying the identical error signature (both
+would need a fourth configuration — JSON-array wire shape *without*
+`response_format` — and capturing a raw failing response body rather
+than only the parse failure, including its HTTP status code) — flagged
+as follow-up work, not done here.
 
 ### Latency (successful calls only)
 
