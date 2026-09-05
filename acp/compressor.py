@@ -69,15 +69,18 @@ RESPONSE_CODEC_TEXTUAL = "textual"
 RESPONSE_CODEC_JSON_ARRAY = "json_array"
 _RESPONSE_CODECS = (RESPONSE_CODEC_TEXTUAL, RESPONSE_CODEC_JSON_ARRAY)
 
-# The `ci` provider's real, currently-only-available model as confirmed
-# by a live agent_protocols_v1 Phase 3 activation test against the real
-# CheapestInference-backed endpoint (a `claude-*` model id 404s there --
-# see cheapestinference_claude_agent_metadata_v2.md §4: this endpoint
-# proxies Claude-shaped requests to DeepSeek, not a real Claude model).
-# Still just a default: which model is best for compression quality is a
-# Phase 6 benchmarking decision, and any caller can override it per-
-# instance.
-DEFAULT_MODEL = "deepseek-v4-flash"
+# The `ci` provider's default model. `deepseek-v4-flash` was the first
+# confirmed-working choice (live agent_protocols_v1 Phase 3 activation
+# test against the real CheapestInference-backed endpoint -- a `claude-*`
+# model id 404s there; see cheapestinference_claude_agent_metadata_v2.md
+# §4: this endpoint proxies Claude-shaped requests to DeepSeek, not a
+# real Claude model). Switched to `mimo-v2.5` once AALP's queue-
+# coalescing admission gained a dynamic, byte-based width ceiling
+# (agent_protocols_v1/STATUS.md, queue-coalescing sections): live
+# benchmarking across both models found mimo-v2.5 the faster of the two
+# under coalescing at every comparable width. Still just a default: any
+# caller can override it per-instance.
+DEFAULT_MODEL = "mimo-v2.5"
 
 # No absolute ceiling on the compressed output's `max_tokens` -- purely a
 # fraction of the payload's own estimated input tokens (half, plus a
