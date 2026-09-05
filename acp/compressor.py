@@ -7,25 +7,38 @@ only -- this module never talks to a provider directly and never falls
 back to native inference on failure; there is no such code path here.
 
 The wire shape is the Anthropic Messages API (`POST /v1/messages` on
-whichever AALP provider id is configured, default `"ci"`):
+whichever AALP provider id is configured, default `"ci"`), submitted via
+AALP's `request.queue` (`acp.aalp_client.submit_queue_member`) rather
+than `request.forward`: every call submits exactly one logical member of
+a possibly-shared physical generation (see `acp.queue_codec`'s
+`ACP-QUEUE/1` grammar) -- AALP may genuinely coalesce it with other
+concurrent calls sharing the same `queue_key` (§6-§13). Each call sends
+a self-describing envelope (`acp.queue_codec.build_queue_envelope`)
+rather than a fully-built physical body; AALP mechanically assembles the
+final Messages-shaped request from however many members land in the
+same generation:
 
     {
       "model": "<configurable>",
       "max_tokens": <computed>,
-      "system": "<COMPRESSOR_SYSTEM_PROMPT>",
-      "messages": [{"role": "user", "content": "<traffic-class preamble + payload>"}]
+      "system": "<COMPRESSOR_SYSTEM_PROMPT + queue_codec's isolation addendum>",
+      "messages": [{"role": "user", "content": "<one or more ACP-QUEUE-ITEM: <id>\\n... blocks, joined by AALP, plus a trailing ACP-QUEUE-MEMBER-COUNT: n>"}]
     }
 
-The compressor's first response line must be exactly one of
-`ACP-MODE: PASS`, `ACP-MODE: COMPACT`, `ACP-MODE: COMPRESS`. For PASS,
-ACP substitutes the original payload verbatim itself -- it never trusts
-whatever (if anything) the model echoes back after that line. For
-COMPACT/COMPRESS, everything after the mode line and its one blank
-line is the transformed output ACP returns.
+The compressor's response may therefore contain other, unknown-to-this-
+call members' blocks alongside this call's own. ACP extracts only its
+own member id's block (`acp.queue_codec.parse_queue_member_result`),
+whose first line must be exactly one of `ACP-MODE: PASS`,
+`ACP-MODE: COMPACT`, `ACP-MODE: COMPRESS`. For PASS, ACP substitutes the
+original payload verbatim itself -- it never trusts whatever (if
+anything) the model echoes back after that line. For COMPACT/COMPRESS,
+everything after the mode line and its one blank line is the transformed
+output ACP returns.
 """
 from __future__ import annotations
 
 import json
+import secrets
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,22 +47,40 @@ from typing import Any
 from acp import bypass
 from acp import gate
 from acp import provenance as provenance_mod
+from acp import queue_codec
+from acp import queue_codec_json
 from acp.aalp_client import AalpClient
 from acp.errors import AcpResult, Outcome, TrafficClass
 from acp.gate import GateAction, TrafficClassThresholds
 from acp.provenance import Provenance
+from acp.queue_codec import QueueMemberRequest, QueueProtocolViolation
 from acp.telemetry import Telemetry
 from acp.warnings import CompressionWarningTracker
 
-# The `ci` provider's real, currently-only-available model as confirmed
-# by a live agent_protocols_v1 Phase 3 activation test against the real
-# CheapestInference-backed endpoint (a `claude-*` model id 404s there --
-# see cheapestinference_claude_agent_metadata_v2.md §4: this endpoint
-# proxies Claude-shaped requests to DeepSeek, not a real Claude model).
-# Still just a default: which model is best for compression quality is a
-# Phase 6 benchmarking decision, and any caller can override it per-
-# instance.
-DEFAULT_MODEL = "deepseek-v4-flash"
+# Selects which response grammar the compressor model is asked to use
+# and how ACP parses its own member's result back out -- request-side
+# member framing (build_member_block/build_queue_envelope) is identical
+# either way (see acp/queue_codec_json.py's module docstring). Exists
+# purely to let a live comparison exercise both the shipped textual
+# ACP-QUEUE/1 grammar and the JSON-array design that experiment
+# recommended, side by side against the same real backend; not a
+# durable public surface, so no config file/env var reads it.
+RESPONSE_CODEC_TEXTUAL = "textual"
+RESPONSE_CODEC_JSON_ARRAY = "json_array"
+_RESPONSE_CODECS = (RESPONSE_CODEC_TEXTUAL, RESPONSE_CODEC_JSON_ARRAY)
+
+# The `ci` provider's default model. `deepseek-v4-flash` was the first
+# confirmed-working choice (live agent_protocols_v1 Phase 3 activation
+# test against the real CheapestInference-backed endpoint -- a `claude-*`
+# model id 404s there; see cheapestinference_claude_agent_metadata_v2.md
+# §4: this endpoint proxies Claude-shaped requests to DeepSeek, not a
+# real Claude model). Switched to `mimo-v2.5` once AALP's queue-
+# coalescing admission gained a dynamic, byte-based width ceiling
+# (agent_protocols_v1/STATUS.md, queue-coalescing sections): live
+# benchmarking across both models found mimo-v2.5 the faster of the two
+# under coalescing at every comparable width. Still just a default: any
+# caller can override it per-instance.
+DEFAULT_MODEL = "mimo-v2.5"
 
 # No absolute ceiling on the compressed output's `max_tokens` -- purely a
 # fraction of the payload's own estimated input tokens (half, plus a
@@ -96,6 +127,22 @@ DEFAULT_THINKING_BUDGET_TOKENS: int | None = None
 # thinking budget when thinking is enabled.
 _MIN_OUTPUT_HEADROOM_ABOVE_THINKING = 256
 
+# DeepSeek's own `reasoning_effort` ("low"/"high"/"max", auto-selected
+# when unset per the backend's own docs) is a separate axis from
+# Anthropic's numeric `thinking.budget_tokens` -- `ci`'s passthrough
+# forwards either untouched (`aalp/forwarder.py` never parses the body),
+# but the two are mutually exclusive here: `reasoning_effort` enables
+# `thinking` without a `budget_tokens` (DeepSeek doesn't accept one in
+# this mode), so combining both would be an ambiguous request shape.
+DEFAULT_REASONING_EFFORT: str | None = None
+
+# Standard Anthropic Messages API sampling controls, independent of the
+# thinking/reasoning_effort axes above -- passed through untouched by
+# `ci`'s passthrough shape when set, left out of the body entirely
+# (letting the backend's own default apply) when `None`.
+DEFAULT_TEMPERATURE: float | None = None
+DEFAULT_TOP_P: float | None = None
+
 # Mirrors `AalpClient.forward`'s own defaults; these are ACP-side
 # round-trip budgets layered on top of AALP's internal ones (see
 # `acp/aalp_client.py`'s `forward()` docstring).
@@ -105,6 +152,15 @@ DEFAULT_TOTAL_TIMEOUT_SECONDS = 60.0
 
 DEFAULT_PROVIDER_ID = "ci"
 _FORWARD_PATH = "/v1/messages"
+
+# Where the assembled member train belongs inside the `shared` envelope
+# (agent_protocols_v1_queue_coalescing_adjustment_metadata_v1.md §11):
+# AALP deep-sets the joined train here once admission happens, replacing
+# `_CONTENT_SENTINEL` below. Generic path traversal on AALP's side --
+# this module is the only place that needs to know it's `messages[0]
+# .content` in Anthropic's Messages API shape.
+_CONTENT_PATH = ["messages", 0, "content"]
+_CONTENT_SENTINEL = "__ACP_QUEUE_PENDING_MEMBER_TRAIN__"
 
 COMPRESSOR_SYSTEM_PROMPT = """You are ACP's compression stage: a loss-minimizing context processor, not a task-solving agent.
 
@@ -123,12 +179,6 @@ Respond with exactly one line as your first line: "ACP-MODE: PASS", "ACP-MODE: C
 If PASS, output nothing else after that line.
 If COMPACT or COMPRESS, follow the mode line with exactly one blank line, then output STRICTLY AND ONLY the transformed content being compressed -- nothing else. Do not include commentary, a preamble, meta-discussion of your own process, an explanation or summary of what you changed, or any restatement of these instructions or the traffic-class/budget header above the payload. Every token you spend must be part of the compressed content itself; your entire output budget is sized for that content alone, so anything else you add directly displaces content and risks truncation.
 """
-
-_MODE_LINES = {
-    "ACP-MODE: PASS": "PASS",
-    "ACP-MODE: COMPACT": "COMPACT",
-    "ACP-MODE: COMPRESS": "COMPRESS",
-}
 
 # UNAVAILABLE / INVALID_RESPONSE / UPSTREAM_ERROR have no dedicated
 # per-outcome counter in `acp.telemetry.COUNTER_NAMES` (only the three
@@ -262,35 +312,76 @@ def _build_request_body(
     model: str,
     target_tokens: int,
     max_tokens: int,
+    member_id: str,
     thinking_budget_tokens: int | None = None,
+    response_codec: str = RESPONSE_CODEC_TEXTUAL,
+    reasoning_effort: str | None = None,
+    temperature: float | None = None,
+    top_p: float | None = None,
 ) -> bytes:
+    """Build this call's self-describing queue envelope (§10-§12) -- not
+    a fully-built physical request body. `shared` is the physical
+    request skeleton with `_CONTENT_SENTINEL` standing in for wherever
+    AALP will later deep-set the assembled member train (possibly
+    including other members this call has no visibility into, §9).
+
+    `response_codec` picks which response grammar the compressor model
+    is told to use (see `RESPONSE_CODEC_*` above); it never affects the
+    request-side member framing itself.
+
+    `reasoning_effort` and `thinking_budget_tokens` are mutually
+    exclusive (enforced at `Compressor` construction, not here) -- when
+    `reasoning_effort` is set, `thinking` is enabled without a numeric
+    `budget_tokens`, since that's DeepSeek's own request shape for this
+    field, not Anthropic's.
+
+    `temperature`/`top_p` are independent of both thinking axes and of
+    each other -- each is included in the body only when explicitly
+    set, otherwise omitted so the backend's own default applies."""
     if thinking_budget_tokens is not None:
         max_tokens = max(
             max_tokens, thinking_budget_tokens + _MIN_OUTPUT_HEADROOM_ABOVE_THINKING
         )
-    request = {
+    user_message = _build_user_message(
+        payload, traffic_class, reduction_hint, target_tokens, max_tokens
+    )
+    if response_codec == RESPONSE_CODEC_JSON_ARRAY:
+        system_prompt = (
+            COMPRESSOR_SYSTEM_PROMPT.rstrip() + "\n\n"
+            + queue_codec_json.QUEUE_JSON_SKELETON_REF_ARRAY_ADDENDUM + "\n"
+        )
+    else:
+        system_prompt = queue_codec.build_system_prompt(COMPRESSOR_SYSTEM_PROMPT)
+    shared: dict[str, Any] = {
         "model": model,
         "max_tokens": max_tokens,
-        "system": COMPRESSOR_SYSTEM_PROMPT,
-        "messages": [
-            {
-                "role": "user",
-                "content": _build_user_message(
-                    payload, traffic_class, reduction_hint, target_tokens, max_tokens
-                ),
-            }
-        ],
+        "system": system_prompt,
+        "messages": [{"role": "user", "content": _CONTENT_SENTINEL}],
     }
-    if thinking_budget_tokens is not None:
-        request["thinking"] = {
+    if response_codec == RESPONSE_CODEC_JSON_ARRAY:
+        shared["response_format"] = queue_codec_json.build_queue_response_format()
+    if reasoning_effort is not None:
+        shared["thinking"] = {"type": "enabled"}
+        shared["reasoning_effort"] = reasoning_effort
+    elif thinking_budget_tokens is not None:
+        shared["thinking"] = {
             "type": "enabled",
             "budget_tokens": thinking_budget_tokens,
         }
-    return json.dumps(request).encode("utf-8")
+    if temperature is not None:
+        shared["temperature"] = temperature
+    if top_p is not None:
+        shared["top_p"] = top_p
+    member = QueueMemberRequest(member_id=member_id, content=user_message)
+    return queue_codec.build_queue_envelope(shared, _CONTENT_PATH, member)
 
 
-def _parse_compressor_response(body: bytes) -> tuple[str, str, dict[str, Any] | None]:
-    """Parse one Anthropic-Messages-shaped compressor response.
+def _parse_compressor_response(
+    body: bytes, member_id: str, response_codec: str = RESPONSE_CODEC_TEXTUAL,
+) -> tuple[str, str, dict[str, Any] | None]:
+    """Parse one Anthropic-Messages-shaped compressor response and
+    extract just `member_id`'s own result, ignoring any other members
+    that may have been coalesced into the same physical response (§9).
 
     Returns `(mode, transformed_text, usage)`. `transformed_text` is
     only meaningful for COMPACT/COMPRESS (the caller must ignore it and
@@ -321,15 +412,17 @@ def _parse_compressor_response(body: bytes) -> tuple[str, str, dict[str, Any] | 
             f"compressor response is not a parseable Messages-shaped body: {exc}"
         ) from exc
 
-    first_line, _, remainder = text.partition("\n")
-    mode = _MODE_LINES.get(first_line.strip())
-    if mode is None:
-        raise CompressorProtocolViolation(
-            f"missing or invalid ACP-MODE line, got {first_line.strip()!r}"
-        )
+    try:
+        if response_codec == RESPONSE_CODEC_JSON_ARRAY:
+            result = queue_codec_json.parse_queue_member_result_json_array(
+                text, member_id)
+        else:
+            result = queue_codec.parse_queue_member_result(text, member_id)
+    except QueueProtocolViolation as violation:
+        raise CompressorProtocolViolation(str(violation)) from violation
 
-    if remainder.startswith("\n"):
-        remainder = remainder[1:]
+    mode = result.mode
+    remainder = result.output
 
     usage = response_json.get("usage")
     if not isinstance(usage, dict):
@@ -378,17 +471,32 @@ class Compressor:
         total_timeout: float = DEFAULT_TOTAL_TIMEOUT_SECONDS,
         thresholds: dict[TrafficClass, TrafficClassThresholds] | None = None,
         root: str | Path | None = None,
+        response_codec: str = RESPONSE_CODEC_TEXTUAL,
+        reasoning_effort: str | None = DEFAULT_REASONING_EFFORT,
+        temperature: float | None = DEFAULT_TEMPERATURE,
+        top_p: float | None = DEFAULT_TOP_P,
     ) -> None:
+        if response_codec not in _RESPONSE_CODECS:
+            raise ValueError(f"unknown response_codec {response_codec!r}")
+        if reasoning_effort is not None and thinking_budget_tokens is not None:
+            raise ValueError(
+                "reasoning_effort and thinking_budget_tokens are mutually "
+                "exclusive"
+            )
         self._aalp_client = aalp_client
         self._telemetry = telemetry
         self._provider_id = provider_id
         self._model = model
         self._thinking_budget_tokens = thinking_budget_tokens
+        self._reasoning_effort = reasoning_effort
+        self._temperature = temperature
+        self._top_p = top_p
         self._queue_timeout = queue_timeout
         self._compression_timeout = compression_timeout
         self._total_timeout = total_timeout
         self._thresholds = thresholds
         self._root = root
+        self._response_codec = response_codec
         self._warnings = CompressionWarningTracker()
 
     @property
@@ -441,38 +549,84 @@ class Compressor:
         self._telemetry.increment("compression_attempts")
         target_tokens = _compute_target_tokens(decision.estimated_tokens)
         max_tokens = _compute_max_tokens(decision.estimated_tokens)
+        # A fresh id per call, unlike Stage 2's fixed "solo": real
+        # coalescing (§6-§14) may land several concurrent compress()
+        # calls in the same physical generation, and §14 requires every
+        # member id within a generation to be distinct.
+        member_id = secrets.token_hex(8)
         body = _build_request_body(
             payload, traffic_class, decision.reduction_hint, self._model,
-            target_tokens, max_tokens, self._thinking_budget_tokens,
+            target_tokens, max_tokens, member_id, self._thinking_budget_tokens,
+            response_codec=self._response_codec,
+            reasoning_effort=self._reasoning_effort,
+            temperature=self._temperature,
+            top_p=self._top_p,
+        )
+
+        # request.queue rather than request.forward (§13's "queue-of-one
+        # uses the identical grammar" -- the same envelope shape is used
+        # whether or not this call ends up actually coalesced with
+        # others). `queue_key` identifies which physical requests are
+        # eligible to coalesce; it is scoped to everything that must
+        # match for a shared physical response to be valid for every
+        # member (provider, upstream path, model, thinking budget) --
+        # payload content is deliberately excluded, since that's exactly
+        # what coalescing is meant to combine across calls.
+        queue_key = (
+            f"acp-queue/1:{self._provider_id}:{_FORWARD_PATH}:"
+            f"{self._model}:{self._thinking_budget_tokens}:{self._reasoning_effort}:"
+            f"{self._temperature}:{self._top_p}"
         )
 
         started = time.monotonic()
-        forward_result = self._aalp_client.forward(
+        queue_result = self._aalp_client.submit_queue_member(
             self._provider_id,
+            queue_key,
             "POST",
             _FORWARD_PATH,
             headers={"Content-Type": "application/json"},
             body=body,
             flow_id=flow_id,
+            member_id=member_id,
             queue_timeout=self._queue_timeout,
             compression_timeout=self._compression_timeout,
             total_timeout=self._total_timeout,
         )
-        # `AalpClient.forward` does not hand back a queue/execution
-        # timing split, so only the whole round-trip is measured here,
-        # against `compression_execution_ms`.
+        # `AalpClient.submit_queue_member` does not hand back a queue/
+        # execution timing split, so only the whole round-trip is
+        # measured here, against `compression_execution_ms`.
+        # `queue_result.generation_id`/`member_count` are available for
+        # cross-member audit correlation but not yet consumed here.
         elapsed_seconds = time.monotonic() - started
 
-        outcome = forward_result.outcome
-        failure_message = forward_result.message
+        outcome = queue_result.outcome
+        failure_message = queue_result.message
         parsed_mode: str | None = None
         parsed_output: str | None = None
         usage: dict[str, Any] | None = None
 
+        # AALP classifies purely at the transport level (agent_protocols_v1
+        # _metadata_v1.md §18): a passed-through 4xx/5xx from the upstream
+        # provider is still Outcome.SUCCESS as far as AALP is concerned,
+        # since interpreting the status/body is this layer's job, not
+        # AALP's. A 429 body is never Messages-shaped, so left unchecked it
+        # would otherwise fall into the generic parse-failure branch below
+        # and come out indistinguishable from a real malformed response --
+        # confirmed live against `ci`: a fair-use throttle on the account
+        # returns `{"type":"error","error":{"type":"rate_limit_error",...}}`
+        # with no `content` key, which is exactly the shape
+        # _parse_compressor_response raises CompressorProtocolViolation for.
+        if outcome is Outcome.SUCCESS and queue_result.status == 429:
+            outcome = Outcome.RATE_LIMITED
+            failure_message = (
+                queue_result.body.decode("utf-8", errors="replace")
+                if queue_result.body else "rate limited (HTTP 429)"
+            )
+
         if outcome is Outcome.SUCCESS:
             try:
                 parsed_mode, parsed_output, usage = _parse_compressor_response(
-                    forward_result.body
+                    queue_result.body, member_id, self._response_codec
                 )
             except CompressorProtocolViolation as violation:
                 outcome = Outcome.INVALID_RESPONSE

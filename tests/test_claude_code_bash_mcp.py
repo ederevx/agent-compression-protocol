@@ -17,7 +17,7 @@ from unittest.mock import patch
 
 from acp.adapters.claude_code_bash_mcp import BashMcpServer, run_bash
 from acp.serve import build_ingress
-from tests.fixtures.fake_aalp_v1 import FakeAalpV1, FakeProvider
+from tests.fixtures.fake_aalp_v1 import MEMBER_ID_TOKEN, FakeAalpV1, FakeProvider
 
 
 class RunBashTest(unittest.TestCase):
@@ -127,7 +127,7 @@ class BashMcpServerProtocolTest(unittest.TestCase):
 
 
 def _compressor_body(mode: str, text: str = "") -> bytes:
-    content_text = f"ACP-MODE: {mode}"
+    content_text = f"ACP-QUEUE-ITEM: {MEMBER_ID_TOKEN}\nACP-MODE: {mode}"
     if text or mode != "PASS":
         content_text += "\n\n" + text
     return json.dumps({"content": [{"type": "text", "text": content_text}]}).encode("utf-8")
