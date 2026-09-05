@@ -124,6 +124,15 @@ DEFAULT_THINKING_BUDGET_TOKENS: int | None = None
 # thinking budget when thinking is enabled.
 _MIN_OUTPUT_HEADROOM_ABOVE_THINKING = 256
 
+# DeepSeek's own `reasoning_effort` ("low"/"high"/"max", auto-selected
+# when unset per the backend's own docs) is a separate axis from
+# Anthropic's numeric `thinking.budget_tokens` -- `ci`'s passthrough
+# forwards either untouched (`aalp/forwarder.py` never parses the body),
+# but the two are mutually exclusive here: `reasoning_effort` enables
+# `thinking` without a `budget_tokens` (DeepSeek doesn't accept one in
+# this mode), so combining both would be an ambiguous request shape.
+DEFAULT_REASONING_EFFORT: str | None = None
+
 # Mirrors `AalpClient.forward`'s own defaults; these are ACP-side
 # round-trip budgets layered on top of AALP's internal ones (see
 # `acp/aalp_client.py`'s `forward()` docstring).
@@ -296,6 +305,7 @@ def _build_request_body(
     member_id: str,
     thinking_budget_tokens: int | None = None,
     response_codec: str = RESPONSE_CODEC_TEXTUAL,
+    reasoning_effort: str | None = None,
 ) -> bytes:
     """Build this call's self-describing queue envelope (§10-§12) -- not
     a fully-built physical request body. `shared` is the physical
@@ -305,7 +315,13 @@ def _build_request_body(
 
     `response_codec` picks which response grammar the compressor model
     is told to use (see `RESPONSE_CODEC_*` above); it never affects the
-    request-side member framing itself."""
+    request-side member framing itself.
+
+    `reasoning_effort` and `thinking_budget_tokens` are mutually
+    exclusive (enforced at `Compressor` construction, not here) -- when
+    `reasoning_effort` is set, `thinking` is enabled without a numeric
+    `budget_tokens`, since that's DeepSeek's own request shape for this
+    field, not Anthropic's."""
     if thinking_budget_tokens is not None:
         max_tokens = max(
             max_tokens, thinking_budget_tokens + _MIN_OUTPUT_HEADROOM_ABOVE_THINKING
@@ -328,7 +344,10 @@ def _build_request_body(
     }
     if response_codec == RESPONSE_CODEC_JSON_ARRAY:
         shared["response_format"] = queue_codec_json.build_queue_response_format()
-    if thinking_budget_tokens is not None:
+    if reasoning_effort is not None:
+        shared["thinking"] = {"type": "enabled"}
+        shared["reasoning_effort"] = reasoning_effort
+    elif thinking_budget_tokens is not None:
         shared["thinking"] = {
             "type": "enabled",
             "budget_tokens": thinking_budget_tokens,
@@ -433,14 +452,21 @@ class Compressor:
         thresholds: dict[TrafficClass, TrafficClassThresholds] | None = None,
         root: str | Path | None = None,
         response_codec: str = RESPONSE_CODEC_TEXTUAL,
+        reasoning_effort: str | None = DEFAULT_REASONING_EFFORT,
     ) -> None:
         if response_codec not in _RESPONSE_CODECS:
             raise ValueError(f"unknown response_codec {response_codec!r}")
+        if reasoning_effort is not None and thinking_budget_tokens is not None:
+            raise ValueError(
+                "reasoning_effort and thinking_budget_tokens are mutually "
+                "exclusive"
+            )
         self._aalp_client = aalp_client
         self._telemetry = telemetry
         self._provider_id = provider_id
         self._model = model
         self._thinking_budget_tokens = thinking_budget_tokens
+        self._reasoning_effort = reasoning_effort
         self._queue_timeout = queue_timeout
         self._compression_timeout = compression_timeout
         self._total_timeout = total_timeout
@@ -508,6 +534,7 @@ class Compressor:
             payload, traffic_class, decision.reduction_hint, self._model,
             target_tokens, max_tokens, member_id, self._thinking_budget_tokens,
             response_codec=self._response_codec,
+            reasoning_effort=self._reasoning_effort,
         )
 
         # request.queue rather than request.forward (§13's "queue-of-one
@@ -521,7 +548,7 @@ class Compressor:
         # what coalescing is meant to combine across calls.
         queue_key = (
             f"acp-queue/1:{self._provider_id}:{_FORWARD_PATH}:"
-            f"{self._model}:{self._thinking_budget_tokens}"
+            f"{self._model}:{self._thinking_budget_tokens}:{self._reasoning_effort}"
         )
 
         started = time.monotonic()

@@ -636,6 +636,41 @@ class ThinkingBudgetRequestBodyTest(unittest.TestCase):
         self.assertEqual(body["shared"]["max_tokens"], 4096)
 
 
+class ReasoningEffortRequestBodyTest(unittest.TestCase):
+    """`_build_request_body` shape correctness for `reasoning_effort` --
+    DeepSeek's own axis, enabling `thinking` without a `budget_tokens`."""
+
+    def test_reasoning_effort_adds_thinking_without_budget(self) -> None:
+        body = _json.loads(
+            _build_request_body(
+                "payload", TrafficClass.GENERAL, None, "m", 256, 512, "test-member",
+                reasoning_effort="low",
+            )
+        )
+        self.assertEqual(body["shared"]["thinking"], {"type": "enabled"})
+        self.assertEqual(body["shared"]["reasoning_effort"], "low")
+
+    def test_reasoning_effort_omits_budget_tokens_key(self) -> None:
+        body = _json.loads(
+            _build_request_body(
+                "payload", TrafficClass.GENERAL, None, "m", 256, 512, "test-member",
+                reasoning_effort="low",
+            )
+        )
+        self.assertNotIn("budget_tokens", body["shared"]["thinking"])
+
+
+class CompressorReasoningEffortConstructionTest(unittest.TestCase):
+    def test_reasoning_effort_and_thinking_budget_mutually_exclusive(self) -> None:
+        client = AalpClient(aalp_root=Path(tempfile.mkdtemp()))
+        telemetry = Telemetry()
+        with self.assertRaises(ValueError):
+            Compressor(
+                client, telemetry,
+                reasoning_effort="low", thinking_budget_tokens=1024,
+            )
+
+
 class CompressorThinkingBudgetWiringTest(CompressorTestCase):
     """`Compressor(thinking_budget_tokens=...)` must actually reach the
     outbound body -- covered end-to-end via the fake AALP fixture rather
@@ -659,6 +694,30 @@ class CompressorThinkingBudgetWiringTest(CompressorTestCase):
         self.assertEqual(
             sent_body["shared"]["thinking"], {"type": "enabled", "budget_tokens": 1024}
         )
+
+
+class CompressorReasoningEffortWiringTest(CompressorTestCase):
+    """`Compressor(reasoning_effort=...)` must actually reach the outbound
+    body, end-to-end via the fake AALP fixture (same rationale as
+    `CompressorThinkingBudgetWiringTest`)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.compressor = Compressor(
+            self.client, self.telemetry, reasoning_effort="low"
+        )
+
+    def test_reasoning_effort_reaches_outbound_request(self) -> None:
+        self._add_ci_provider()
+        self.fake.program_response(
+            "ci", "/v1/messages", outcome="success",
+            body=_compressor_body("COMPACT", "ok"),
+        )
+        self.compressor.compress(_BIG_PAYLOAD, TrafficClass.GENERAL)
+        sent_body = _json.loads(self.fake.last_body)
+        self.assertEqual(sent_body["shared"]["thinking"], {"type": "enabled"})
+        self.assertEqual(sent_body["shared"]["reasoning_effort"], "low")
+        self.assertNotIn("budget_tokens", sent_body["shared"]["thinking"])
 
 
 class ResponseCodecJsonArrayTest(CompressorTestCase):
